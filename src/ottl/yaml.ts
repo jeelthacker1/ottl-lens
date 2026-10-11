@@ -30,6 +30,18 @@ export interface ExtractedOTTL {
    * else the component's top-level `error_mode`, else null (version-dependent default).
    */
   errorMode: string | null;
+  /**
+   * How the YAML scalar is written. `line`/`col` point at the first OTTL character
+   * (after an opening quote). Offsets inside `text` map 1:1 to the document only for
+   * `plain` and for `single` without `''` escapes; `double` escapes and block scalars
+   * shift positions, so edits (quick fixes) are only safe for the former.
+   */
+  quote: "plain" | "single" | "double" | "block";
+}
+
+/** Text offsets map 1:1 onto the document, so an edit at an offset is safe. */
+export function editableInPlace(x: ExtractedOTTL): boolean {
+  return x.quote === "plain" || (x.quote === "single" && !x.text.includes("'"));
 }
 
 function scalarAt(map: unknown, key: string): string | null {
@@ -169,11 +181,14 @@ function walkRouting(compId: string, value: unknown, out: ExtractedOTTL[], lc: a
   }
 }
 
-function pushScalar(node: Scalar, out: ExtractedOTTL[], lc: any, meta: Omit<ExtractedOTTL, "text" | "line" | "col">): void {
+function pushScalar(node: Scalar, out: ExtractedOTTL[], lc: any, meta: Omit<ExtractedOTTL, "text" | "line" | "col" | "quote">): void {
   const v = node.value;
   if (typeof v !== "string" || v.trim() === "") return;
   const { line, col } = posOf(node, lc);
-  out.push({ text: v, line, col, ...meta });
+  const quote = node.type === "QUOTE_SINGLE" ? "single" : node.type === "QUOTE_DOUBLE" ? "double"
+    : node.type === "BLOCK_LITERAL" || node.type === "BLOCK_FOLDED" ? "block" : "plain";
+  // The node range starts at the opening quote; OTTL starts one character later.
+  out.push({ text: v, line, col: quote === "single" || quote === "double" ? col + 1 : col, quote, ...meta });
 }
 
 /**
@@ -213,15 +228,58 @@ export function stripOttlComments(text: string): string {
     .join("\n");
 }
 
+export interface StatementLine {
+  /** 0-based document line of the statement. */
+  line: number;
+  text: string;
+}
+
 export function collectStatementsForDryRun(
   yamlText: string,
   cursorLine: number
-): { statements: string; signal: string | null; errorMode: string | null } {
+): { statements: string; signal: string | null; errorMode: string | null; items: StatementLine[] } {
   const stmts = extractOTTL(yamlText).filter((x) => x.dialect === "statement");
-  if (stmts.length === 0) return { statements: "", signal: null, errorMode: null };
+  if (stmts.length === 0) return { statements: "", signal: null, errorMode: null, items: [] };
   const atOrAbove = stmts.filter((s) => s.line <= cursorLine);
   const chosen = atOrAbove.length > 0 ? atOrAbove[atOrAbove.length - 1] : stmts[0];
   const group = stmts.filter((s) => s.component === chosen.component && s.signal === chosen.signal);
   // The error_mode of the statement group under the cursor (groups may override the processor's).
-  return { statements: group.map((s) => s.text).join("\n"), signal: chosen.signal, errorMode: chosen.errorMode };
+  return {
+    statements: group.map((s) => s.text).join("\n"),
+    signal: chosen.signal,
+    errorMode: chosen.errorMode,
+    items: group.map((s) => ({ line: s.line, text: s.text.trim() })),
+  };
+}
+
+export interface DryRunTarget {
+  /** Line of the block's first statement (where the ▶ button goes). */
+  line: number;
+  component: string;
+  signal: string | null;
+  count: number;
+}
+
+/** One target per (component, signal) block of runnable statements, in document order. */
+export function dryRunTargets(yamlText: string): DryRunTarget[] {
+  const out: DryRunTarget[] = [];
+  const seen = new Map<string, DryRunTarget>();
+  for (const s of extractOTTL(yamlText)) {
+    if (s.dialect !== "statement" || !s.signal) continue; // routing statements aren't runnable here
+    const key = `${s.component}\u0000${s.signal}`;
+    const t = seen.get(key);
+    if (t) { t.count++; continue; }
+    const target = { line: s.line, component: s.component, signal: s.signal, count: 1 };
+    seen.set(key, target);
+    out.push(target);
+  }
+  return out;
+}
+
+/** Statement lines of a standalone .ottl file (comments and blank lines skipped). */
+export function ottlFileStatementLines(text: string): StatementLine[] {
+  return text.split(/\r?\n/).flatMap((raw, line) => {
+    const t = stripOttlComments(raw);
+    return t ? [{ line, text: t }] : [];
+  });
 }

@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.3.0
+
+### Results where you work
+- **▶ Dry-run** buttons above every runnable transform block in Collector YAML, and at the top of `.ottl` files. Clicking one opens the panel and runs that block. Can be turned off with `ottl.codeLens.enabled`.
+- After a run, each statement's verdict appears **at the end of its line**. Examples: `✓ changed  + log.attributes["env"] = "production"`, `⚠ no effect`, `○ matched nothing`, `✗ <explanation>`. Hover a verdict for the full detail. Verdicts clear when you edit the file, or with **OTTL: Clear Inline Verdicts**.
+
+### "Can never match" checks
+New warnings for OTTL that is valid but can't work, using the field types from the upstream context docs:
+- A typed field compared with a string: `metric.type == "Sum"`, `span.trace_id == "0102…"`, `log.severity_number == "9"`. `==` is never true; `!=` is always true.
+- A string assigned to a typed field: `set(span.trace_id, "<hex>")` (ignored up to v0.149, a run-time error from v0.150) and `set(log.severity_number, "INFO")` (ignored up to v0.140, an error from v0.141).
+
+The trace uses the same check. A guard like that now gets "This where clause can never match any payload", instead of "matched nothing".
+
+### Quick fixes
+One-click fixes for:
+- `"Sum"` → `METRIC_DATA_TYPE_SUM` (and the `span.kind`, `span.status.code`, `log.severity_number` and aggregation-temporality enums)
+- `span.trace_id` → `span.trace_id.string`
+- `"9"` → `9`
+- path typos (`log.atributes` → `log.attributes`)
+- mis-cased functions (`parsejson` → `ParseJSON`)
+- `Base64Decode(x)` → `Decode(x, "base64")`
+
+Every fix was applied and re-run against the bundled engine to confirm the fixed statement works.
+
+### Redaction check
+After a run, the panel lists values in the output that still look like personal data or credentials:
+- emails
+- Luhn-valid card numbers
+- JWTs
+- bearer tokens
+- US SSN format
+
+For example, an email you deleted from the attributes but that is still inside `log.body`. IP addresses are deliberately not flagged.
+
+### Corrected wording
+- **`propagate`:** now says the whole **batch** is dropped, not the record.
+- **`trace_id` hint:** states the version boundary. It is silent up to v0.149 (including the bundled v0.146.0 engine). From v0.150 it errors: logged under `ignore`, the batch is dropped under `propagate`, and nothing is visible under `silent`.
+- **Converter-returned-nil hint:** silent up to v0.157; by v0.161 it is an error.
+
+These were checked against a cross-version harness (v0.140 / v0.150 / v0.157 / v0.161).
+
+### Fixes
+- **Squiggles in quoted YAML values** (`- 'set(…)'`) were one character to the left. Positions now point at the OTTL text, not the quote.
+- **The catalog now tracks the latest collector release (v0.162.0)** rather than `main`, so hover never shows unreleased changes.
+
 ## 0.2.1
 
 Correctness release.

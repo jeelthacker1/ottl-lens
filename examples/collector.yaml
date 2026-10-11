@@ -35,6 +35,7 @@ processors:
           - set(log.attributes["parsed"], ParseJson(body))   # WARN: unknown fn (did you mean ParseJSON?)
           - set(log.attributes["bad"] = "x")                 # ERROR: single '='
           - keep_keys(log.attributes, ["a", "b")             # ERROR: unbalanced ] vs )
+          - set(log.body, "x") where log.severity_number == "9"   # WARN: can never match (int64 vs string) — quick fix: 9
 
   # --- filter: new style ---
   filter/drop-noise:

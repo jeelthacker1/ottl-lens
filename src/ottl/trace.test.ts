@@ -228,7 +228,7 @@ describe("traceStatements", () => {
   it("distinguishes an unmatched guard from an inert statement", () => {
     const r = traceStatements('set(env, "prod") where false', "logs", PAYLOAD, engine);
     expect(r.steps[0].verdict).toBe("not-matched");
-    expect(r.steps[0].note).toMatch(/where clause matched no records/);
+    expect(r.steps[0].note).toMatch(/No record in this payload matched the where clause/);
     expect(r.noEffectCount).toBe(0);
   });
 
@@ -430,5 +430,29 @@ describe("traceStatements — guard probe robustness", () => {
     const r = traceStatements('set(a, "1")', "logs", PAYLOAD, engine);
     expect(r.finalOutput).toBeUndefined();
     expect(r.ok).toBe(false);
+  });
+});
+
+describe("0.3 wording (checked against the trade harness)", () => {
+  it("propagate drops the whole batch, not a record", () => {
+    expect(describeErrorMode("propagate")).toMatch(/whole batch the processor received — not just this record — is DROPPED/);
+  });
+  it("the trace_id hint is version-qualified", () => {
+    const h = knownNoOpHint('set(span.trace_id, "0102")')!;
+    expect(h).toMatch(/up to v0\.149 — including the bundled v0\.146\.0 engine — ignore the assignment silently/);
+    expect(h).toMatch(/From v0\.150 it is a run-time error: logged under ignore, the batch is dropped under propagate, invisible under silent/);
+  });
+  it("the converter hint is version-qualified", () => {
+    expect(knownNoOpHint('set(log.body, Int("x"))')).toMatch(/silent on collectors up to v0\.157; by v0\.161 it is an error/);
+  });
+  it("a type-mismatched guard says it can never match", () => {
+    const engine: EvalFn = (statements, _s, payload) => {
+      if (/where/.test(statements) && !/1 == 2/.test(statements)) return { ok: true, output: payload };
+      if (/where 1 == 2/.test(statements)) return { ok: true, output: payload };
+      const doc = JSON.parse(payload); doc.touched = true; return { ok: true, output: JSON.stringify(doc) };
+    };
+    const r = traceStatements('set(log.body, "x") where log.severity_number == "9"', "logs", PAYLOAD, engine);
+    expect(r.steps[0].verdict).toBe("not-matched");
+    expect(r.steps[0].note).toMatch(/^This where clause can never match any payload: log\.severity_number is an int64/);
   });
 });

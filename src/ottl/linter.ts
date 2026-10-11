@@ -15,6 +15,10 @@
 import { KNOWN_FUNCTIONS, CASEFOLD_INDEX } from "./catalog";
 import { EXTRA_KNOWN, REMOVED_REPLACEMENTS } from "./extras";
 import { REMOVED_UPSTREAM, EXPERIMENTAL_FUNCTIONS, FEATURE_GATES } from "./catalog";
+import { checkTypes, type Fix } from "./typecheck";
+import { segmentsAfter, suggestSegment } from "./explain";
+
+export type { Fix };
 
 /** "requires the ottl.functions.enableLambda feature gate (alpha since v0.155.0, off by default)". */
 export function describeGate(gate: string): string {
@@ -33,6 +37,32 @@ export interface Diagnostic {
   message: string;
   severity: Severity;
   code: string;
+  /** A safe, mechanical fix for this diagnostic (offered as a quick fix). Columns on the same line. */
+  fix?: Fix;
+}
+
+/** Index of a `#` comment outside string literals, or the line length. */
+function commentStart(line: string): number {
+  let inString = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inString) {
+      if (ch === "\\") i++;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') inString = true;
+    else if (ch === "#") return i;
+  }
+  return line.length;
+}
+
+/** Index of the ")" that closes the "(" at `open`, in masked text; -1 if unclosed. */
+function closingParen(masked: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < masked.length; i++) {
+    if (masked[i] === "(") depth++;
+    else if (masked[i] === ")" && --depth === 0) return i;
+  }
+  return -1;
 }
 
 const LANG_WORDS = new Set(["where", "and", "or", "not", "true", "false", "nil"]);
@@ -109,7 +139,7 @@ function checkDelimiters(masked: string, line: number, diags: Diagnostic[]): voi
   }
 }
 
-function checkFunctions(masked: string, line: number, diags: Diagnostic[]): void {
+function checkFunctions(masked: string, raw: string, line: number, diags: Diagnostic[]): void {
   const re = /([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(masked)) !== null) {
@@ -118,6 +148,15 @@ function checkFunctions(masked: string, line: number, diags: Diagnostic[]): void
     if (REMOVED_UPSTREAM.has(name) && !EXTRA_KNOWN.has(name)) {
       // Still works on older collectors (and in the bundled engine), so not a warning.
       const replacement = REMOVED_REPLACEMENTS[name];
+      let fix: Fix | undefined;
+      if (name === "Base64Decode") {
+        const open = m.index + m[0].length - 1;
+        const close = closingParen(masked, open);
+        const arg = close > open ? raw.slice(open + 1, close).trim() : "";
+        if (close > open && arg && !arg.includes(",")) {
+          fix = { title: `Replace with Decode(${arg}, "base64")`, start: m.index, end: close + 1, replacement: `Decode(${arg}, "base64")` };
+        }
+      }
       diags.push({
         line,
         startCol: m.index,
@@ -125,7 +164,8 @@ function checkFunctions(masked: string, line: number, diags: Diagnostic[]): void
         message: `"${name}" has been removed from the latest OTTL.` +
           (replacement ? ` Use ${replacement} instead.` : " It only works on older collector versions."),
         severity: "info",
-        code: "ottl.removedFunction"
+        code: "ottl.removedFunction",
+        fix,
       });
       continue;
     }
@@ -153,8 +193,48 @@ function checkFunctions(masked: string, line: number, diags: Diagnostic[]): void
       endCol: m.index + name.length,
       message: `Unknown OTTL function "${name}".${hint}`,
       severity: "warning",
-      code: "ottl.unknownFunction"
+      code: "ottl.unknownFunction",
+      fix: suggestion ? { title: `Change to ${suggestion}`, start: m.index, end: m.index + name.length, replacement: suggestion } : undefined,
     });
+  }
+}
+
+const PATH_ROOTS = "log|span|spanevent|metric|datapoint|resource|instrumentation_scope";
+
+/**
+ * Flag a path segment that isn't in the catalog but is one typo away from one that is
+ * (log.atributes → log.attributes). Unknown segments with no close match are left
+ * alone: the catalog documents paths, it doesn't prove others are invalid.
+ */
+function checkPaths(masked: string, line: number, diags: Diagnostic[]): void {
+  const re = new RegExp(`(?<![\\w.])(${PATH_ROOTS})((?:\\.[a-z_]+)+)`, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(masked)) !== null) {
+    let prefix = m[1];
+    let col = m.index + prefix.length;
+    for (const seg of m[2].slice(1).split(".")) {
+      col += 1; // the dot
+      const known = segmentsAfter(prefix);
+      if (known.length === 0 || known.includes(seg)) {
+        if (known.length === 0) break;
+        prefix = `${prefix}.${seg}`;
+        col += seg.length;
+        continue;
+      }
+      const fixSeg = suggestSegment(prefix, seg);
+      if (fixSeg) {
+        diags.push({
+          line,
+          startCol: col,
+          endCol: col + seg.length,
+          message: `"${prefix}.${seg}" isn't a known path. Did you mean "${prefix}.${fixSeg}"?`,
+          severity: "warning",
+          code: "ottl.unknownPath",
+          fix: { title: `Change to ${prefix}.${fixSeg}`, start: col, end: col + seg.length, replacement: fixSeg },
+        });
+      }
+      break;
+    }
   }
 }
 
@@ -212,9 +292,15 @@ export function lint(text: string, opts: LintOptions = {}): Diagnostic[] {
       });
     }
     checkDelimiters(masked, idx, diags);
-    if (checkUnknownFns) checkFunctions(masked, idx, diags);
+    if (checkUnknownFns) checkFunctions(masked, raw, idx, diags);
     checkSingleEquals(masked, idx, diags);
     checkEmptyWhere(masked, idx, diags);
+    checkPaths(masked, idx, diags);
+    // Type checks need the literal values, so they run on the raw line (comments stripped).
+    const code = raw.slice(0, commentStart(raw));
+    for (const t of checkTypes(code)) {
+      diags.push({ line: idx, startCol: t.start, endCol: t.end, message: t.message, severity: "warning", code: t.code, fix: t.fix });
+    }
   });
   return diags;
 }

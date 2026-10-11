@@ -30,6 +30,9 @@ await build({
       export { traceStatements, summarize } from "./src/ottl/trace";
       export { SAMPLES, samplePayloadText } from "./src/ottl/samples";
       export { normalizePayloadInput } from "./src/ottl/payload";
+      export { checkTypes } from "./src/ottl/typecheck";
+      export { lint } from "./src/ottl/linter";
+      export { scanForPii } from "./src/ottl/redact";
     `,
     resolveDir: root,
     loader: "ts",
@@ -101,6 +104,44 @@ const debugLog = ["ResourceLog #0", "ScopeLogs #0", "LogRecord #0", "Timestamp: 
 const conv = L.normalizePayloadInput(debugLog);
 const cr = engine('set(log.attributes["x"], "y")', "logs", conv.json);
 check("debug-exporter text converts and the engine accepts it", conv.ok && cr.ok, cr.error);
+
+// 6. Type checks agree with the engine, and every quick fix actually works.
+//    Fixtures follow the trade harness (ottl-silence-matrix/fixtures/README.md).
+const SPAN = JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{ traceId: "0102030405060708090a0b0c0d0e0f10", spanId: "0102030405060708", name: "orig", kind: 1, startTimeUnixNano: "1", endTimeUnixNano: "2" }] }] }] });
+const METRIC = JSON.stringify({ resourceMetrics: [{ scopeMetrics: [{ metrics: [{ name: "orig_sum", sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: [{ timeUnixNano: "1", asInt: "1" }] } }] }] }] });
+const LOG = JSON.stringify({ resourceLogs: [{ scopeLogs: [{ logRecords: [{ timeUnixNano: "1", severityNumber: 9, body: { stringValue: "orig" } }] }] }] });
+const fixed = (s, i) => s.slice(0, i.fix.start) + i.fix.replacement + s.slice(i.fix.end);
+for (const [label, stmt, sig, payload] of [
+  ["A2 metric.type == \"Sum\"", 'set(metric.description, "x") where metric.type == "Sum"', "metrics", METRIC],
+  ["A4 span.trace_id == hex", 'set(span.name, "x") where span.trace_id == "0102030405060708090a0b0c0d0e0f10"', "traces", SPAN],
+  ["A6 severity_number == \"9\"", 'set(log.body, "x") where log.severity_number == "9"', "logs", LOG],
+]) {
+  const before = trace(stmt, sig, payload).steps[0];
+  check(`${label}: flagged statically and the trace says it can never match`,
+    L.checkTypes(stmt).length === 1 && before.verdict === "not-matched" && /can never match/.test(before.note ?? ""), before.note);
+  const after = trace(fixed(stmt, L.checkTypes(stmt)[0]), sig, payload).steps[0];
+  check(`${label}: after the quick fix the statement changes the payload`, after.verdict === "changed", after.verdict);
+}
+const c1 = 'set(span.trace_id, "11111111111111111111111111111111")';
+check("C1 set(span.trace_id, hex): flagged, and the .string fix works",
+  L.checkTypes(c1).length === 1 && trace(fixed(c1, L.checkTypes(c1)[0]), "traces", SPAN).steps[0].verdict === "changed");
+const c2 = 'set(log.severity_number, "WARN")';
+check("C2 set(log.severity_number, \"WARN\"): flagged, and the enum fix works",
+  L.checkTypes(c2).length === 1 && trace(fixed(c2, L.checkTypes(c2)[0]), "logs", LOG).steps[0].verdict === "changed");
+const typoStmt = 'set(log.atributes["a"], "1")';
+const typoDiag = L.lint(typoStmt).find((d) => d.code === "ottl.unknownPath");
+check("path typo quick fix produces a working statement", !!typoDiag && trace(fixed(typoStmt, typoDiag), "logs", LOG).steps[0].verdict === "changed");
+
+// 7. propagate wording and the redaction check, on real output.
+const rt2 = trace('set(log.attributes["j"], ParseJSON(log.body))', "logs", sample("logs-simple"), "propagate").steps[0];
+check("propagate consequence says the whole batch is dropped", /whole batch/.test(rt2.consequence ?? ""), rt2.consequence);
+const redact = trace([
+  'merge_maps(log.attributes, ParseJSON(log.body), "upsert")',
+  'delete_key(log.attributes, "user_email")',
+].join("\n"), "logs", sample("logs-json-body-pii"));
+const pii = L.scanForPii(JSON.parse(redact.finalOutput)).map((f) => f.label);
+check("redaction check: deleting the attribute still leaves the email in log.body",
+  !pii.includes('log.attributes["user_email"]') && pii.includes("log.body"), JSON.stringify(pii));
 
 console.log(failed ? `\n${failed} check(s) FAILED` : "\nAll real-engine checks passed.");
 process.exit(failed ? 1 : 0);

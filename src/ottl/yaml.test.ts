@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractOTTL, collectStatementsForDryRun, stripOttlComments } from "./yaml";
+import { extractOTTL, collectStatementsForDryRun, stripOttlComments, editableInPlace, dryRunTargets, ottlFileStatementLines } from "./yaml";
 
 describe("extractOTTL — transform processor", () => {
   it("extracts advanced-style statements with context + signal + position", () => {
@@ -163,7 +163,7 @@ describe("collectStatementsForDryRun", () => {
       "    log_conditions:",
       '      - IsMatch(log.body, ".*x.*")',
     ].join("\n");
-    expect(collectStatementsForDryRun(filterOnly, 3)).toEqual({ statements: "", signal: null, errorMode: null });
+    expect(collectStatementsForDryRun(filterOnly, 3)).toEqual({ statements: "", signal: null, errorMode: null, items: [] });
   });
 });
 
@@ -230,5 +230,67 @@ describe("extractOTTL — robustness", () => {
     const got = extractOTTL(yaml);
     expect(got).toHaveLength(1);
     expect(got[0].component).toBe("transform");
+  });
+});
+
+describe("quoted scalars: positions point at the first OTTL character", () => {
+  const y = [
+    "processors:",
+    "  transform:",
+    "    log_statements:",
+    '      - set(log.body, "plain")',
+    "      - 'set(log.body, \"single\")'",
+    '      - "set(log.body, \\"double\\")"',
+    "      - 'set(log.body, ''it''s'')'",
+  ].join("\n");
+  const lines = y.split("\n");
+  const got = extractOTTL(y);
+
+  it("reports quote style and the column of the OTTL text, not the quote", () => {
+    expect(got.map((g) => g.quote)).toEqual(["plain", "single", "double", "single"]);
+    for (const g of got) expect(lines[g.line][g.col]).toBe("s");
+  });
+
+  it("only allows in-place edits where offsets map 1:1", () => {
+    expect(got.map(editableInPlace)).toEqual([true, true, false, false]);
+  });
+});
+
+describe("dry-run targets and statement lines", () => {
+  const y = [
+    "processors:",                         // 0
+    "  transform/a:",                      // 1
+    "    log_statements:",                 // 2
+    "      - context: log",                // 3
+    "        statements:",                 // 4
+    '          - set(log.body, "a")',      // 5
+    '          - set(log.body, "b")',      // 6
+    "    trace_statements:",               // 7
+    '      - set(span.name, "x")',         // 8
+    "  filter:",                           // 9
+    "    log_conditions:",                 // 10
+    '      - IsMatch(log.body, "x")',      // 11
+    "connectors:",                         // 12
+    "  routing:",                          // 13
+    "    table:",                          // 14
+    "      - statement: route()",          // 15
+  ].join("\n");
+
+  it("returns one target per runnable block with its first line and count", () => {
+    expect(dryRunTargets(y)).toEqual([
+      { line: 5, component: "transform/a", signal: "logs", count: 2 },
+      { line: 8, component: "transform/a", signal: "traces", count: 1 },
+    ]);
+  });
+
+  it("returns the statement lines of the block under the cursor", () => {
+    expect(collectStatementsForDryRun(y, 6).items).toEqual([{ line: 5, text: 'set(log.body, "a")' }, { line: 6, text: 'set(log.body, "b")' }]);
+  });
+
+  it("lists statement lines of a .ottl file, skipping comments and blanks", () => {
+    expect(ottlFileStatementLines('# c\n\nset(log.body, "a") # x\n  keep_keys(log.attributes, [])')).toEqual([
+      { line: 2, text: 'set(log.body, "a")' },
+      { line: 3, text: "keep_keys(log.attributes, [])" },
+    ]);
   });
 });

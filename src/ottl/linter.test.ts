@@ -208,3 +208,47 @@ describe("lambdas (experimental, xottl)", () => {
     expect(describeGate("made.up")).toBe("the `made.up` feature gate");
   });
 });
+
+describe("0.3: type checks, path typos and quick fixes", () => {
+  const apply = (line: string, d: Diagnostic) => line.slice(0, d.fix!.start) + d.fix!.replacement + line.slice(d.fix!.end);
+
+  it("reports a never-matching comparison as a warning with a fix", () => {
+    const line = 'set(log.body, "x") where log.severity_number == "9"';
+    const d = lint(line).find((x) => x.code === "ottl.neverMatches")!;
+    expect(d.severity).toBe("warning");
+    expect(apply(line, d)).toBe('set(log.body, "x") where log.severity_number == 9');
+  });
+
+  it("ignores type issues inside a trailing comment", () => {
+    expect(lint('set(log.body, "x") # where log.severity_number == "9"').filter((x) => x.code === "ottl.neverMatches")).toEqual([]);
+  });
+
+  it("flags a path typo with a fix, but stays quiet about unknown paths without a close match", () => {
+    const line = 'set(log.atributes["a"], "1")';
+    const d = lint(line).find((x) => x.code === "ottl.unknownPath")!;
+    expect(d.message).toBe('"log.atributes" isn\'t a known path. Did you mean "log.attributes"?');
+    expect(apply(line, d)).toBe('set(log.attributes["a"], "1")');
+    expect(lint('set(log.zzzzzzzz, "1")').filter((x) => x.code === "ottl.unknownPath")).toEqual([]);
+    expect(lint('set(span.status.code, STATUS_CODE_ERROR)').filter((x) => x.code === "ottl.unknownPath")).toEqual([]);
+    expect(lint('set(log.trace_id.string, "x")').filter((x) => x.code === "ottl.unknownPath")).toEqual([]);
+  });
+
+  it("does not treat a path inside a string as a path", () => {
+    expect(lint('set(log.body, "log.atributes")').filter((x) => x.code === "ottl.unknownPath")).toEqual([]);
+  });
+
+  it("offers the casing fix for a mis-cased function", () => {
+    const line = "set(log.body, parsejson(log.body))";
+    expect(apply(line, lint(line).find((x) => x.code === "ottl.unknownFunction")!)).toBe("set(log.body, ParseJSON(log.body))");
+  });
+
+  it("rewrites Base64Decode(x) as Decode(x, \"base64\")", () => {
+    const line = 'set(log.body, Base64Decode(log.attributes["b"]))';
+    const d = lint(line).find((x) => x.code === "ottl.removedFunction")!;
+    expect(apply(line, d)).toBe('set(log.body, Decode(log.attributes["b"], "base64"))');
+  });
+
+  it("offers no Base64Decode fix when the call is malformed", () => {
+    expect(lint("set(log.body, Base64Decode(log.body").find((x) => x.code === "ottl.removedFunction")!.fix).toBeUndefined();
+  });
+});

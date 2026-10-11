@@ -24,6 +24,7 @@
 import { stripOttlComments } from "./yaml";
 import { presentDiff, type PresentedDiff } from "./present";
 import { classifyError, explainEngineError, type ErrorClass } from "./explain";
+import { neverMatchReason } from "./typecheck";
 
 export type StepVerdict = "changed" | "no-effect" | "not-matched" | "error";
 
@@ -241,7 +242,7 @@ export function isErrorMode(x: unknown): x is ErrorMode {
 export function describeErrorMode(mode: ErrorMode): string {
   switch (mode) {
     case "propagate":
-      return "With error_mode: propagate (the default before v0.153), this record would be DROPPED from the pipeline.";
+      return "With error_mode: propagate (the default before v0.153), the error is returned up the pipeline and the whole batch the processor received — not just this record — is DROPPED.";
     case "ignore":
       return "With error_mode: ignore (the default since v0.153), the error is logged and the remaining statements still run — the trace continues without this statement.";
     case "silent":
@@ -308,11 +309,14 @@ export function knownNoOpHint(statement: string): string | undefined {
     return "set() on metric.type is accepted but does nothing in the transform processor. To change a metric's type, use a conversion function such as convert_gauge_to_sum() or convert_sum_to_gauge().";
   }
   if (/\b(trace_id|span_id|parent_span_id)\b/.test(statement) && !/\.string\b/.test(statement)) {
-    return "trace_id/span_id are bytes internally. Assigning a hex string without the .string suffix silently does nothing — use span.trace_id.string (or span_id.string).";
+    return "trace_id/span_id hold bytes; assigning a hex string needs the .string suffix (span.trace_id.string). " +
+      "Collectors up to v0.149 — including the bundled v0.146.0 engine — ignore the assignment silently. " +
+      "From v0.150 it is a run-time error: logged under ignore, the batch is dropped under propagate, invisible under silent.";
   }
   const body = stripWhereClause(statement) ?? statement; // ignore converters inside the guard
   if (/^\s*set\s*\(/.test(body) && /,\s*.*\b[A-Z][A-Za-z0-9]*\s*\(/.test(body)) {
-    return "If the converter on the right returned nil for this input (for example Int(\"abc\")), set() has nothing to write. Otherwise the field already had this value.";
+    return "Either the field already had this value, or the converter on the right returned nil (for example Int(\"abc\")) so set() had nothing to write. " +
+      "A failed conversion is silent on collectors up to v0.157; by v0.161 it is an error (a literal argument such as Int(\"abc\") fails when the config loads).";
   }
   return undefined;
 }
@@ -410,11 +414,14 @@ export function traceStatements(
       const probe = evalFn(unguarded, signal, JSON.stringify(previous));
       const probed = probe.ok ? parse(probe.output) : undefined;
       if (probed !== undefined && diffJSON(previous, probed).length > 0) {
+        const never = neverMatchReason(statement);
         steps.push({
           index: i,
           statement,
           verdict: "not-matched",
-          note: "The statement is fine, but its where clause matched no records in this payload.",
+          note: never
+            ? `This where clause can never match any payload: ${never}`
+            : "No record in this payload matched the where clause; without it, the statement would change the payload.",
         });
         continue;
       }

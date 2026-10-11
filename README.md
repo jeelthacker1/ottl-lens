@@ -20,12 +20,16 @@ OTTL Lens does that loop in the editor, in about a second, with the same transfo
 
 | Feature | What it does |
 |---|---|
-| **Per-statement trace** | Runs your statements one at a time with the real engine and gives each a verdict: `changed` (with a diff), **`no effect`**, `matched nothing`, or `error`. |
+| **▶ Dry-run from the editor** | A **▶ Dry-run** button above every runnable transform block (and at the top of `.ottl` files) opens the panel and runs that block. |
+| **Per-statement trace** | Runs your statements one at a time with the real engine and gives each a verdict: `changed` (with a diff), **`no effect`**, `matched nothing`, or `error`. The verdict also appears **at the end of each statement's line** in your YAML; hover it for the detail. |
+| **"Can never match" checks** | Flags comparisons that are valid but can never be true because a typed field is compared with a string — `metric.type == "Sum"`, `span.trace_id == "0102…"`, `log.severity_number == "9"` — and string assignments to typed fields such as `set(span.trace_id, "<hex>")`. |
+| **Quick fixes** | One click: `"Sum"` → `METRIC_DATA_TYPE_SUM`, `span.trace_id` → `span.trace_id.string`, `"9"` → `9`, `log.atributes` → `log.attributes`, `parsejson` → `ParseJSON`, `Base64Decode(x)` → `Decode(x, "base64")`. Each fix was checked to make the statement work on the real engine. |
+| **Redaction check** | After a run, lists values in the output that still look like personal data or credentials (emails, card numbers, JWTs, bearer tokens, SSNs) — e.g. an email you removed from the attributes but that is still inside `log.body`. |
 | **Readable diffs, in OTTL** | Changes are shown as OTTL paths and values — `+ log.attributes["env"] = "production"`, `− log.attributes["environment"] = "staging"` — and type changes are called out: `200 → "200" (int → string)`. |
 | **Paste what you already have** | The payload box accepts OTLP JSON, JSON Lines from the file exporter, or **raw `debug` exporter output** straight from `docker logs` — converted automatically, with the signal detected from the content. |
 | **Realistic samples** | Nine built-in payloads shaped around real transforms: a k8s log with a JSON body and PII, health-check noise, an errored HTTP span with an exception event, a SQL span with an email in the query, counters, histograms. |
 | **Errors you can act on** | Engine errors are translated: `log.atributes` → *did you mean `log.attributes`?*, `parsejson` → *did you mean `ParseJSON`?*, `attributes["x"]` → *needs its context prefix*. Config errors ("the collector won't start") are kept separate from runtime errors ("what `error_mode` does"). |
-| **`error_mode` that actually changes the result** | The dry-run uses your block's own `error_mode`. With `propagate`, a runtime error drops the record and the trace stops; with `ignore` or `silent`, the trace continues past the failed statement, as a collector would. If your config doesn't set it, you're told the default depends on your collector version: `ignore` since v0.153, `propagate` before. |
+| **`error_mode` that actually changes the result** | The dry-run uses your block's own `error_mode`. With `propagate`, a runtime error drops the whole batch the processor received and the trace stops; with `ignore` or `silent`, the trace continues past the failed statement, as a collector would. If your config doesn't set it, you're told the default depends on your collector version: `ignore` since v0.153, `propagate` before. |
 | **Hover docs** | Hover any function, path or enum: signature, description, examples and a link to the upstream reference. Paths show their type (`log.severity_number` → `int64`). |
 | **Autocomplete** | Functions with argument placeholders (editors only at the start of a statement), context fields after `log.` / `span.` / `metric.` / `datapoint.` / `resource.`, enums and keywords. Works while the YAML is half-typed. |
 | **Collector-YAML aware linting** | Finds and lints OTTL in `transform` / `filter` processors (flat, advanced and legacy shapes) and the `routing` connector, on the right lines. Unknown / mis-cased functions, unbalanced delimiters, single `=`, unterminated strings, empty `where`. |
@@ -58,7 +62,7 @@ The converted JSON replaces your paste in the box, so you can see and edit exact
 |---|---|
 | **changed** | The statement modified the payload — shown as a diff in OTTL paths. |
 | **no effect** | The statement ran without error and changed **nothing**. Usually a bug. |
-| **matched nothing** | The statement is fine, but its `where` guard excluded every record in this payload. |
+| **matched nothing** | The `where` guard excluded every record in this payload. If the guard compares a typed field with a string, it says the clause **can never match** any payload. |
 | **error** | The engine rejected it, with an explanation and what happens next. |
 
 `no effect` is the point. These are real, silent failures — each reproduced on the bundled engine:
@@ -80,7 +84,10 @@ The engine runs entirely offline in the extension host via WebAssembly — no ne
 - **The dry-run executes statements, not filter conditions.** Filter conditions are linted, documented and autocompleted.
 - **`ignore`/`silent` are simulated per statement.** If a statement fails for only some records, a real collector would still apply it to the others; the dry-run skips it for all of them.
 - **Debug-exporter conversion** covers logs, spans (with events) and gauge / sum / histogram metrics. Exponential histograms, summaries, span links and exemplars are skipped, with a note.
-- **The linter is heuristic, not a parser.** It catches structural and naming mistakes; argument types and paths are checked authoritatively by the dry-run.
+- **Version-specific behaviour is described, not executed.** Several silent failures changed across collector versions (for example `set(span.trace_id, "<hex>")` is ignored up to v0.149 and an error from v0.150). Hints state the version boundaries; the dry-run itself shows v0.146.0 behaviour.
+- **The catalog tracks the latest collector release** (currently v0.162.0), not unreleased changes on `main`.
+- **The linter is heuristic, not a parser.** It catches structural, naming and type mistakes; anything else is checked authoritatively by the dry-run. Path-typo warnings only appear when there is a close match in the catalog.
+- **Quick fixes in double-quoted YAML** (`- "set(…)"`) aren't offered, because escapes shift positions; diagnostics still appear. Plain and single-quoted values get fixes.
 - **Templated configs are best-effort.** Helm / Go-templated YAML that doesn't parse yields no lint diagnostics; hover and autocomplete still work line by line.
 
 ## Develop

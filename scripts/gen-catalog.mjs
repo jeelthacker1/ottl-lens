@@ -258,6 +258,11 @@ if (paths.size === 0) problems.push("no context paths parsed");
 let source = "unknown revision";
 try {
   source = execSync(`git -C "${pkgDir}" log -1 --format="%h %cs"`, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  // Prefer the release tag name when the checkout is exactly at one (catalogs track releases, not main).
+  try {
+    const tag = execSync(`git -C "${pkgDir}" describe --tags --exact-match --match "v[0-9]*" HEAD`, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    if (tag) source = `${tag} (${source})`;
+  } catch { /* not at a tag */ }
 } catch { /* not a git checkout */ }
 
 const sort = (s) => [...s].sort((a, b) => a.localeCompare(b));

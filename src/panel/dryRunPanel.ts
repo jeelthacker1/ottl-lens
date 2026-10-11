@@ -1,9 +1,22 @@
 import * as vscode from "vscode";
 import { evalOTTL } from "../ottl/wasmRunner";
-import { collectStatementsForDryRun } from "../ottl/yaml";
+import { collectStatementsForDryRun, ottlFileStatementLines, type StatementLine } from "../ottl/yaml";
 import { traceStatements, summarize, isErrorMode, DEFAULT_ERROR_MODE_NOTE, type ErrorMode } from "../ottl/trace";
 import { SAMPLES, samplePayloadText } from "../ottl/samples";
 import { normalizePayloadInput, describeConversion } from "../ottl/payload";
+import { mapVerdicts } from "../ottl/inline";
+import { scanForPii, describePii } from "../ottl/redact";
+import type { InlineVerdicts } from "../verdicts";
+
+interface CollectedInput {
+  text: string;
+  signal: string | null;
+  errorMode: string | null;
+  fromYaml: boolean;
+  /** Document lines of the statements, for inline verdicts. */
+  items: StatementLine[];
+  uri: vscode.Uri | undefined;
+}
 
 const PANEL_TITLE = "OTTL Dry Run";
 const VIEW_TYPE = "ottl.dryRun";
@@ -17,6 +30,12 @@ type InboundMessage =
 
 export class DryRunPanel {
   private static instance: DryRunPanel | undefined;
+  /** Where inline verdicts are drawn (set once by the extension on activation). */
+  static inline: InlineVerdicts | undefined;
+  /** Run as soon as the webview has the statements (used by the ▶ CodeLens). */
+  private pendingAutoRun = false;
+  private currentItems: StatementLine[] = [];
+  private currentUri: vscode.Uri | undefined;
   private readonly panel: vscode.WebviewPanel;
   private disposables: vscode.Disposable[] = [];
   /** Statements last shown in the panel (whole .ottl file, or the YAML block at the cursor). */
@@ -42,9 +61,10 @@ export class DryRunPanel {
     this.panel.webview.onDidReceiveMessage(
       (msg: InboundMessage) => {
         if (msg.type === "run") {
-          this.handleRun(msg.signal ?? "logs", msg.payload ?? "", (msg.errorMode as ErrorMode) ?? "propagate");
+          this.handleRun(msg.signal ?? "logs", msg.payload ?? "", isErrorMode(msg.errorMode) ? msg.errorMode : "ignore");
         } else if (msg.type === "ready") {
           this.pushStatements();
+          if (this.pendingAutoRun) { this.pendingAutoRun = false; this.post({ type: "runNow" }); }
         } else if (msg.type === "openFile") {
           void this.openPayloadFile();
         }
@@ -65,28 +85,35 @@ export class DryRunPanel {
     );
   }
 
-  static show(context: vscode.ExtensionContext): void {
+  static show(context: vscode.ExtensionContext, opts: { autoRun?: boolean } = {}): void {
     if (DryRunPanel.instance) {
-      DryRunPanel.instance.panel.reveal(vscode.ViewColumn.Beside, true);
+      const p = DryRunPanel.instance;
+      p.panel.reveal(vscode.ViewColumn.Beside, true);
+      if (opts.autoRun) {
+        p.pushStatements();
+        p.post({ type: "runNow" });
+      }
       return;
     }
     DryRunPanel.instance = new DryRunPanel(context);
+    DryRunPanel.instance.pendingAutoRun = !!opts.autoRun;
   }
 
   /**
    * Gather the OTTL statements to run from the active editor:
    * a whole `.ottl` file, or the transform block at the cursor in a Collector YAML.
    */
-  private collectInput(
-    editor: vscode.TextEditor | undefined
-  ): { text: string; signal: string | null; errorMode: string | null; fromYaml: boolean } {
-    const none = { text: "", signal: null, errorMode: null, fromYaml: false };
+  private collectInput(editor: vscode.TextEditor | undefined): CollectedInput {
+    const none: CollectedInput = { text: "", signal: null, errorMode: null, fromYaml: false, items: [], uri: undefined };
     if (!editor) return none;
     const doc = editor.document;
-    if (doc.languageId === "ottl") return { ...none, text: doc.getText() };
+    if (doc.languageId === "ottl") {
+      const text = doc.getText();
+      return { ...none, text, items: ottlFileStatementLines(text), uri: doc.uri };
+    }
     if (doc.languageId === "yaml" || doc.languageId === "yml") {
       const r = collectStatementsForDryRun(doc.getText(), editor.selection.active.line);
-      return { text: r.statements, signal: r.signal, errorMode: r.errorMode, fromYaml: true };
+      return { text: r.statements, signal: r.signal, errorMode: r.errorMode, fromYaml: true, items: r.items, uri: doc.uri };
     }
     return none;
   }
@@ -97,7 +124,9 @@ export class DryRunPanel {
     // Keep the statements we last captured instead of wiping them.
     if (!editor) return;
     const filename = editor.document.fileName.split(/[\\/]/).pop() ?? "";
-    const { text, signal, errorMode, fromYaml } = this.collectInput(editor);
+    const { text, signal, errorMode, fromYaml, items, uri } = this.collectInput(editor);
+    this.currentItems = items;
+    this.currentUri = uri;
     this.currentStatements = text;
     this.currentBlockSignal = signal;
     this.currentBlockErrorMode = errorMode;
@@ -113,6 +142,8 @@ export class DryRunPanel {
     const blockSignal = fresh.text ? fresh.signal : this.currentBlockSignal;
     const blockErrorMode = fresh.text ? fresh.errorMode : this.currentBlockErrorMode;
     const fromYaml = fresh.text ? fresh.fromYaml : this.currentFromYaml;
+    const items = fresh.text ? fresh.items : this.currentItems;
+    const uri = fresh.text ? fresh.uri : this.currentUri;
     if (!statements.trim()) {
       this.post({
         type: "result",
@@ -160,6 +191,17 @@ export class DryRunPanel {
     if (trace.error) {
       this.post({ type: "result", ok: false, error: trace.error, notes });
       return;
+    }
+
+    // Show each statement's verdict next to its line in the editor.
+    if (uri && items.length) DryRunPanel.inline?.show(uri, mapVerdicts(trace.steps, items));
+
+    // Redaction check on what would leave the processor.
+    if (trace.finalOutput) {
+      try {
+        const pii = describePii(scanForPii(JSON.parse(trace.finalOutput)));
+        if (pii) notes.push(pii);
+      } catch { /* output already validated by the trace; ignore */ }
     }
 
     this.post({
@@ -691,6 +733,12 @@ window.addEventListener('message', (event) => {
       }
     }
     lastStatements = msg.text;
+    return;
+  }
+
+  if (msg.type === 'runNow') {
+    // Triggered by the ▶ Dry-run button in the editor: run with the current payload.
+    if (!runBtn.disabled) runBtn.click();
     return;
   }
 

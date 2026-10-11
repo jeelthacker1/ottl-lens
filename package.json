@@ -2,7 +2,7 @@
   "name": "ottl-lens",
   "displayName": "OTTL Lens (community)",
   "description": "Per-statement dry-run with the real OTTL engine, hover docs, autocomplete and linting for the OpenTelemetry Transformation Language (OTTL) in Collector YAML. Community project, not affiliated with or endorsed by the OpenTelemetry project or CNCF.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "publisher": "srikar-kompella",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -63,8 +63,21 @@
       {
         "command": "ottl.dryRun",
         "title": "OTTL: Dry Run (run statements against sample telemetry)"
+      },
+      {
+        "command": "ottl.dryRunAt",
+        "title": "OTTL: Dry Run This Block"
+      },
+      {
+        "command": "ottl.clearVerdicts",
+        "title": "OTTL: Clear Inline Verdicts"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        { "command": "ottl.dryRunAt", "when": "false" }
+      ]
+    },
     "configuration": {
       "title": "OTTL Lens",
       "properties": {
@@ -72,6 +85,11 @@
           "type": "boolean",
           "default": true,
           "description": "Warn when a function call is not in the known OTTL editor/converter catalog."
+        },
+        "ottl.codeLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a \"▶ Dry-run\" button above each runnable transform block and at the top of .ottl files."
         }
       }
     }
