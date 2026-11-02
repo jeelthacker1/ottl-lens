@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { lint, Diagnostic, describeGate } from "./linter";
+import { lint, Diagnostic, describeGate, sliceParams } from "./linter";
 
 const codes = (ds: Diagnostic[]) => ds.map((d) => d.code);
 const onLine = (ds: Diagnostic[], line: number) => ds.filter((d) => d.line === line);
@@ -250,5 +250,41 @@ describe("0.3: type checks, path typos and quick fixes", () => {
 
   it("offers no Base64Decode fix when the call is malformed", () => {
     expect(lint("set(log.body, Base64Decode(log.body").find((x) => x.code === "ottl.removedFunction")!.fix).toBeUndefined();
+  });
+});
+
+describe("0.4: list arguments and component functions", () => {
+  it("flags a plain value where a list is required, with a fix", () => {
+    const d = lint('keep_keys(log.attributes, "http.method")').find((x) => x.code === "ottl.sliceArgument")!;
+    expect(d).toMatchObject({ severity: "error", startCol: 26, endCol: 39 });
+    expect(d.message).toBe('"keep_keys" expects a list for keys — write ["http.method"]. A plain value is rejected when the collector loads the config.');
+    expect(d.fix).toEqual({ title: 'Wrap in a list: ["http.method"]', start: 26, end: 39, replacement: '["http.method"]' });
+    expect(lint('set(log.body, Concat("a", "-"))').filter((x) => x.code === "ottl.sliceArgument")).toHaveLength(1);
+    expect(lint("set(log.body, Format(\"%d\", 5))").find((x) => x.code === "ottl.sliceArgument")?.fix?.replacement).toBe("[5]");
+  });
+
+  it("accepts lists, paths and converters in list positions", () => {
+    for (const s of [
+      'keep_keys(log.attributes, ["a", "b"])',
+      'keep_keys(log.attributes, Split(log.attributes["k"], ","))',
+      'keep_keys(log.attributes, log.attributes["list"])',
+      'set(log.body, Concat([log.body, "x,y"], "-"))',
+    ]) expect(lint(s).filter((x) => x.code === "ottl.sliceArgument"), s).toEqual([]);
+  });
+
+  it("reads list parameters from signatures", () => {
+    expect(sliceParams("keep_keys(target, keys[])")).toEqual([{ index: 1, name: "keys" }]);
+    expect(sliceParams("Format(format, []vals)")).toEqual([{ index: 1, name: "vals" }]);
+    expect(sliceParams("set(target, value)")).toEqual([]);
+    expect(sliceParams("nonsense")).toEqual([]);
+  });
+
+  it("no longer flags transform- and filter-processor functions as unknown", () => {
+    for (const s of [
+      'convert_gauge_to_sum("cumulative", false) where metric.name == "x"',
+      "extract_count_metric(true)",
+      'set(log.attributes["cef"], ParseCEF(log.body))',
+      'HasAttrOnDatapoint("k", "v")',
+    ]) expect(lint(s).filter((x) => x.code === "ottl.unknownFunction"), s).toEqual([]);
   });
 });

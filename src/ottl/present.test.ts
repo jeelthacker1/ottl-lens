@@ -119,7 +119,7 @@ describe("displayValue / kindOf", () => {
     expect(displayValue({ boolValue: true })).toBe("true");
     expect(displayValue({ doubleValue: 0.5 })).toBe("0.5");
     expect(displayValue({ bytesValue: "aGk=" })).toBe('"bytes(aGk=)"');
-    expect(displayValue({})).toBe("nil");
+    expect(displayValue({})).toBe("(empty)");
     expect(displayValue(undefined)).toBe("nil");
   });
 

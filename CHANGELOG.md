@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.4.0
+
+### True for your collector version
+- **Collector version picker.** The dry-run can now run on the OTTL engine of 9 collector versions — v0.140.0, v0.146.0, v0.150.0, v0.153.0, v0.157.0, v0.160.0, v0.161.0, v0.163.0, v0.164.1 — the releases where a documented OTTL behaviour changed. Each is the real transform processor at that release, compiled to WebAssembly.
+- **The bundled engine is now v0.164.1** (OTTL 1.x stable). Earlier releases bundled v0.146.0.
+- **Found in your workspace.** If a compose file, Helm values, Kubernetes manifest, Dockerfile or `go.mod` pins `opentelemetry-collector-contrib`, the panel preselects the closest engine and says where it found the version. Override it with the `ottl.collectorVersion` setting.
+- **Downloads only when you ask.** Non-bundled engines (about 5 MB each) download once from this extension's GitHub release after you agree. Each is checked against a sha256 built into the extension before it runs, and is cached. Nothing else goes over the network.
+
+### Upgrade check
+**Compare with** runs the same block and payload on a second version and lists every statement whose result changes between the two.
+
+### Correctness: `set()` with a missing value now overwrites
+Since collector v0.161, `set(target, value)` writes `nil` as an **empty value**. So `set(log.attributes["user"], log.attributes["missing"])` no longer does nothing: it **overwrites `user` with an empty value**. 0.3.0 reported this as "no effect". Verified on engines at v0.160 and v0.161.
+- On v0.161+ the step is marked **⚠ wrote an empty value** in the panel and in the editor, with a suggested guard: `where log.attributes["missing"] != nil`.
+- On older versions, the "no effect" hint now names the v0.161 change.
+
+### More version-accurate hints
+- **Failed conversions.** `Int(log.attributes["s"])` with a non-numeric value returns nil up to v0.159 and is a run-time error from v0.160 (#50564).
+- **`trace_id` hint.** Shown only where it applies: up to v0.149. From v0.150 the trace shows the real run-time error.
+- **Functions newer than an engine.** These are named with the version you need, for example: "`clear` … added after v0.157.0 … pick collector version v0.160.0 or newer".
+- **Missing `error_mode`.** When the block doesn't set it, the panel names the picked version's default.
+
+### Experimental lambdas run
+Add `ottl.functions.enableLambda` to the new `ottl.dryRun.featureGates` setting, the same way you'd pass `--feature-gates`. `Filter`, `MapEach`, `Reduce` and the other lambda functions then execute on v0.157+ engines. Without the gate, the panel explains how to enable it.
+
+### Lint
+- **List arguments.** A plain value where a function takes a list is an error the collector rejects at startup, for example `keep_keys(log.attributes, "http.method")` or `Concat("a", "-")`. The quick fix wraps it: `["http.method"]`. Confirmed on the real engines.
+- **Transform and filter processor functions are no longer "unknown".** This was a false positive in 0.3.0 and covers:
+  - `convert_gauge_to_sum`, `convert_sum_to_gauge`, `extract_count_metric` and the other metric functions
+  - `copy_metric`, `scale_metric`, `aggregate_on_attributes`
+  - `ParseCEF`, `ParseCLF`, `ParseELF`, `ParseLEEF`
+  - `set_semconv_span_name`
+  - `HasAttrOnDatapoint`, `HasAttrKeyOnDatapoint`
+
+  They're documented in hover and autocomplete as processor-only.
+- **`flatten_data`.** Deprecated since v0.164.0; the quick fix replaces it with `flatten: { log: true }`. Setting both is flagged as the config error it is.
+
+### Under the hood
+- **Engine runner.** It now forces `error_mode: propagate` so that every runtime error reaches the trace. The processor default became `ignore` in v0.153 and would hide them; `ignore` and `silent` are simulated by the trace, as before.
+- **New syntax-error format.** Parse errors from v0.163+ (`1:25: … near \`…\``) are explained like the old format.
+- **Catalog.** Regenerated from contrib v0.164.1, with per-version function history.
+
 ## 0.3.0
 
 ### Results where you work

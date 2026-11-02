@@ -11,9 +11,10 @@
  *
  * The interesting verdict is `no-effect`: a statement that ran without error and
  * changed nothing. That is the most common way OTTL fails in production. Verified
- * against the real engine (contrib v0.146.0): `set(metric.type, …)` is accepted and
- * does nothing; assigning `span.trace_id` without the `.string` suffix does nothing;
- * `set(x, Int("abc"))` writes nothing because the converter returns nil.
+ * against the real engines: `set(metric.type, …)` is accepted and does nothing;
+ * assigning `span.trace_id` a hex string does nothing up to v0.149 (an error from
+ * v0.150); `set(x, <nil>)` writes nothing up to v0.160, and from v0.161 writes an
+ * EMPTY value — overwriting x — which is reported as a cautioned `changed`.
  *
  * We further split `no-effect` into two causes by re-running the statement with
  * its `where` guard removed. If the unguarded form *does* change the payload, the
@@ -25,6 +26,7 @@ import { stripOttlComments } from "./yaml";
 import { presentDiff, type PresentedDiff } from "./present";
 import { classifyError, explainEngineError, type ErrorClass } from "./explain";
 import { neverMatchReason } from "./typecheck";
+import { atLeast, BOUNDARY } from "./versions";
 
 export type StepVerdict = "changed" | "no-effect" | "not-matched" | "error";
 
@@ -68,6 +70,13 @@ export interface StepResult {
   explanation?: string;
   /** Why a no-op happened, in words the user can act on. */
   note?: string;
+  /** A `changed` step that is probably not what was intended (it wrote an empty value). */
+  caution?: boolean;
+}
+
+export interface TraceOptions {
+  /** Collector version of the engine that produced the results; drives version-specific hints. */
+  engineVersion?: string;
 }
 
 export interface TraceResult {
@@ -152,6 +161,86 @@ function isKeyedOrEmpty(v: unknown): v is Array<Record<string, unknown> & { key:
   return Array.isArray(v) && v.every((el) => isRecord(el) && typeof el.key === "string");
 }
 
+const ANY_VALUE_KINDS = ["stringValue", "intValue", "doubleValue", "boolValue", "bytesValue", "kvlistValue", "arrayValue"];
+
+function isEmptyRecord(v: Record<string, unknown>): boolean {
+  return Object.keys(v).length === 0;
+}
+
+function isAnyValue(v: Record<string, unknown>): boolean {
+  const keys = Object.keys(v);
+  return keys.length === 1 && ANY_VALUE_KINDS.includes(keys[0]);
+}
+
+/** An OTLP AnyValue with no value set, bare (`{}`) or as an attribute (`{key, value: {}}`). */
+function isEmptyValue(v: unknown): boolean {
+  if (!isRecord(v)) return false;
+  if ("key" in v && "value" in v) return isRecord(v.value) && isEmptyRecord(v.value);
+  return isEmptyRecord(v);
+}
+
+/** True when this step wrote an empty value somewhere (added or overwritten). */
+export function wroteEmpty(diff: DiffEntry[]): "created" | "overwritten" | undefined {
+  let created = false;
+  for (const d of diff) {
+    if (d.kind === "changed" && isEmptyValue(d.after) && !isEmptyValue(d.before)) return "overwritten";
+    if (d.kind === "added" && isEmptyValue(d.after)) created = true;
+  }
+  return created ? "created" : undefined;
+}
+
+/**
+ * The two arguments of a top-level `set(target, value)` call, ignoring any `where`.
+ * Commas inside strings, brackets and nested calls are skipped.
+ */
+export function setArguments(statement: string): { target: string; value: string } | undefined {
+  const body = stripWhereClause(statement) ?? statement;
+  const m = /^\s*set\s*\(/.exec(body);
+  if (!m) return undefined;
+  const masked = maskStrings(body);
+  let depth = 0;
+  let comma = -1;
+  let end = -1;
+  for (let i = m[0].length; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") {
+      if (depth === 0) { end = i; break; }
+      depth--;
+    } else if (ch === "," && depth === 0 && comma === -1) comma = i;
+  }
+  if (comma === -1 || end === -1) return undefined;
+  const target = body.slice(m[0].length, comma).trim();
+  const value = body.slice(comma + 1, end).trim();
+  return target && value ? { target, value } : undefined;
+}
+
+/** A literal can never be nil; only paths and converter calls can. */
+function canBeNil(value: string): boolean {
+  return !/^(".*"|-?\d+(\.\d+)?|true|false|\[.*\]|\{.*\})$/.test(value.trim());
+}
+
+function engineName(engineVersion: string | undefined): string {
+  return engineVersion ? `this engine (${engineVersion})` : "this engine";
+}
+
+/** The note for a `changed` step whose set() wrote an empty value (v0.161+ behaviour). */
+export function emptyWriteNote(statement: string, how: "created" | "overwritten"): string {
+  const args = setArguments(statement);
+  const target = args?.target ?? "the target";
+  const value = args?.value ?? "the value";
+  const done = how === "overwritten" ? `${target} was overwritten with an empty value` : `${target} was created with an empty value`;
+  return `${value} was nil in this record (for example a missing attribute), and since v0.161 set() writes nil as an empty value, so ${done}. ` +
+    `Collectors up to v0.160 skip the write and leave ${target} untouched. ` +
+    guardAdvice(statement, value);
+}
+
+function guardAdvice(statement: string, value: string): string {
+  return stripWhereClause(statement)
+    ? `To write only when there is a value, add \`and ${value} != nil\` to the where clause.`
+    : `To write only when there is a value, add \`where ${value} != nil\`.`;
+}
+
 function joinPath(base: string, seg: string): string {
   return base ? `${base}${seg}` : seg.replace(/^\./, "");
 }
@@ -192,6 +281,11 @@ export function diffJSON(before: unknown, after: unknown, path = ""): DiffEntry[
   }
 
   if (isRecord(before) && isRecord(after)) {
+    // A value overwritten with an empty AnyValue (`{}`, how set(x, nil) lands from v0.161)
+    // is one change of the whole value, not the removal of its `stringValue` field.
+    if (isEmptyRecord(before) !== isEmptyRecord(after) && (isAnyValue(before) || isAnyValue(after))) {
+      return [{ path: path || "(root)", kind: "changed", before, after }];
+    }
     const out: DiffEntry[] = [];
     // The engine omits empty repeated fields, so a record with no attributes has no
     // `attributes` key at all. Expand an appearing/disappearing attribute list into
@@ -229,6 +323,16 @@ export function diffJSON(before: unknown, after: unknown, path = ""): DiffEntry[
 export const DEFAULT_ERROR_MODE_NOTE =
   "This block doesn't set error_mode, so the collector's default applies: ignore on v0.153 and later, " +
   "propagate on v0.152 and earlier. The dry-run uses ignore. Set error_mode explicitly to get the same behaviour on every version.";
+
+/** The same note for a known collector version: name that version's default. */
+export function defaultErrorModeNote(engineVersion?: string): string {
+  if (!engineVersion) return DEFAULT_ERROR_MODE_NOTE;
+  const def = atLeast(engineVersion, BOUNDARY.defaultErrorModeIgnore) ? "ignore" : "propagate";
+  return `This block doesn't set error_mode, so collector ${engineVersion} uses its default: ${def}` +
+    (def === "propagate" ? " (a runtime error drops the whole batch)" : "") +
+    ". The default changed to ignore in v0.153; set error_mode explicitly to get the same behaviour on every version." +
+    (def === "propagate" ? " Choose propagate in the error_mode menu to see what this version does." : "");
+}
 
 export function isErrorMode(x: unknown): x is ErrorMode {
   return x === "propagate" || x === "ignore" || x === "silent";
@@ -302,21 +406,37 @@ function parse(json: string | undefined): unknown {
 
 /**
  * Statements whose no-op behaviour is a known trap, with a usable hint.
- * Each case below was reproduced on the real engine (contrib v0.146.0).
+ * Each case below was reproduced on the real engines at both sides of the boundary
+ * it names (scripts/verify-engine.mjs).
+ *
+ * @param engineVersion collector version of the engine that reported the no-op
  */
-export function knownNoOpHint(statement: string): string | undefined {
+export function knownNoOpHint(statement: string, engineVersion?: string): string | undefined {
   if (/\bmetric\.type\b/.test(statement) && /^\s*set\s*\(\s*metric\.type\b/.test(statement)) {
     return "set() on metric.type is accepted but does nothing in the transform processor. To change a metric's type, use a conversion function such as convert_gauge_to_sum() or convert_sum_to_gauge().";
   }
-  if (/\b(trace_id|span_id|parent_span_id)\b/.test(statement) && !/\.string\b/.test(statement)) {
+  if (/\b(trace_id|span_id|parent_span_id)\b/.test(statement) && !/\.string\b/.test(statement) &&
+      !atLeast(engineVersion, BOUNDARY.traceIdString)) {
     return "trace_id/span_id hold bytes; assigning a hex string needs the .string suffix (span.trace_id.string). " +
-      "Collectors up to v0.149 — including the bundled v0.146.0 engine — ignore the assignment silently. " +
+      `Collectors up to v0.149 — including ${engineName(engineVersion)} — ignore the assignment silently. ` +
       "From v0.150 it is a run-time error: logged under ignore, the batch is dropped under propagate, invisible under silent.";
   }
-  const body = stripWhereClause(statement) ?? statement; // ignore converters inside the guard
-  if (/^\s*set\s*\(/.test(body) && /,\s*.*\b[A-Z][A-Za-z0-9]*\s*\(/.test(body)) {
-    return "Either the field already had this value, or the converter on the right returned nil (for example Int(\"abc\")) so set() had nothing to write. " +
-      "A failed conversion is silent on collectors up to v0.157; by v0.161 it is an error (a literal argument such as Int(\"abc\") fails when the config loads).";
+  const args = setArguments(statement);
+  if (args && canBeNil(args.value)) {
+    if (atLeast(engineVersion, BOUNDARY.setWritesNil)) {
+      // From v0.161 a nil value would have been written as empty (a visible change), so a
+      // no-op here means the field already held this value.
+      return `${args.target} already had this value, so set() changed nothing.`;
+    }
+    const converter = /\b[A-Z][A-Za-z0-9]*\s*\(/.test(args.value);
+    // Up to v0.159 a conversion that fails (Int("abc")) returns nil; from v0.160 it is an error.
+    const silentConversion = converter && !atLeast(engineVersion, BOUNDARY.failedConversionError);
+    return `Either ${args.target} already had this value, or ${args.value} was nil in this record ` +
+      (silentConversion ? "(a missing input, or a conversion such as Int(\"abc\") that failed) " : converter ? "(a missing input) " : "(for example a missing attribute) ") +
+      `and set() wrote nothing — which is what collectors up to v0.160 do, including ${engineName(engineVersion)}. ` +
+      `From v0.161 set() writes nil as an EMPTY value, overwriting ${args.target}` +
+      (silentConversion ? ". From v0.160 a failed conversion is an error instead of nil (a literal such as Int(\"abc\") fails when the config loads). " : ". ") +
+      guardAdvice(statement, args.value);
   }
   return undefined;
 }
@@ -330,13 +450,15 @@ export function knownNoOpHint(statement: string): string | undefined {
  * @param evalFn         engine call (injected for testability)
  * @param errorMode      the block's error_mode; defaults to the transform processor's
  *                       current default (`ignore` since v0.153)
+ * @param opts           engine version, for version-specific hints
  */
 export function traceStatements(
   statementsText: string,
   signal: string,
   payloadJSON: string,
   evalFn: EvalFn,
-  errorMode: ErrorMode = "ignore"
+  errorMode: ErrorMode = "ignore",
+  opts: TraceOptions = {}
 ): TraceResult {
   const statements = splitStatements(statementsText);
   if (statements.length === 0) {
@@ -383,7 +505,7 @@ export function traceStatements(
         verdict: "error",
         error: message,
         errorClass,
-        explanation: explainEngineError(message, statement),
+        explanation: explainEngineError(message, statement, opts.engineVersion),
         consequence: describeError(errorClass, errorMode),
       });
       // Under ignore/silent a runtime error skips only this statement; everything
@@ -402,7 +524,13 @@ export function traceStatements(
 
     const diff = diffJSON(previous, current);
     if (diff.length > 0) {
-      steps.push({ index: i, statement, verdict: "changed", diff, display: presentDiff(diff, previous) });
+      const step: StepResult = { index: i, statement, verdict: "changed", diff, display: presentDiff(diff, previous) };
+      const empty = setArguments(statement) ? wroteEmpty(diff) : undefined;
+      if (empty) {
+        step.caution = true;
+        step.note = emptyWriteNote(statement, empty);
+      }
+      steps.push(step);
       previous = current;
       continue;
     }
@@ -432,7 +560,7 @@ export function traceStatements(
       index: i,
       statement,
       verdict: "no-effect",
-      note: knownNoOpHint(statement) ?? "This statement ran without error but changed nothing in this payload.",
+      note: knownNoOpHint(statement, opts.engineVersion) ?? "This statement ran without error but changed nothing in this payload.",
     });
   }
 

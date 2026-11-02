@@ -97,8 +97,11 @@ func buildYAML(statements, signal string) string {
 	if len(lines) == 0 {
 		return ""
 	}
+	// error_mode is forced to propagate so every runtime error reaches the caller. The
+	// default changed to ignore in v0.153, which would swallow errors silently; the
+	// extension simulates ignore/silent itself (src/ottl/trace.ts).
 	var sb strings.Builder
-	sb.WriteString("transform:\n  ")
+	sb.WriteString("transform:\n  error_mode: propagate\n  ")
 	sb.WriteString(signalKey)
 	sb.WriteString(":\n    - statements:\n")
 	for _, s := range lines {

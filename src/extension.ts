@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { lint, Severity, Diagnostic as OttlDiagnostic } from "./ottl/linter";
-import { extractOTTL, editableInPlace, dryRunTargets } from "./ottl/yaml";
-import { initWasm } from "./ottl/wasmRunner";
+import { extractOTTL, editableInPlace, dryRunTargets, configIssues } from "./ottl/yaml";
+import { EngineManager } from "./engineManager";
+import { BUNDLED_ENGINE } from "./ottl/engines";
 import { DryRunPanel } from "./panel/dryRunPanel";
 import { registerAssistProviders } from "./providers";
 import { InlineVerdicts } from "./verdicts";
@@ -79,6 +80,15 @@ function lintDocument(doc: vscode.TextDocument, collection: vscode.DiagnosticCol
       const canEdit = editableInPlace(ex);
       for (const d of lint(ex.text, opts)) add(d, ex.line, ex.col, canEdit && d.line === 0);
     }
+    // Processor settings around the OTTL (deprecated / conflicting keys).
+    for (const c of configIssues(doc.getText())) {
+      const range = new vscode.Range(c.line, c.startCol, c.line, c.endCol);
+      const diag = new vscode.Diagnostic(range, c.message, c.severity === "error" ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning);
+      diag.source = "ottl";
+      diag.code = c.code;
+      diagnostics.push(diag);
+      if (c.fix) fixes.push({ diagnostic: diag, title: c.fix.title, range, replacement: c.fix.replacement });
+    }
   } else {
     return; // not a file we handle
   }
@@ -137,14 +147,12 @@ class DryRunLenses implements vscode.CodeLensProvider {
   }
 }
 
-async function ensureEngine(context: vscode.ExtensionContext): Promise<boolean> {
+let engines: EngineManager | undefined;
+
+/** Make sure the bundled engine loads before opening the panel (other versions load on demand). */
+async function ensureEngine(): Promise<boolean> {
   try {
-    // WASM init is lazy and idempotent; the progress notification only shows on first call.
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "Loading OTTL engine…", cancellable: false },
-      () => initWasm(context)
-    );
-    return true;
+    return !!(await engines?.get(BUNDLED_ENGINE));
   } catch (err) {
     void vscode.window.showErrorMessage(String(err));
     return false;
@@ -156,6 +164,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const inline = new InlineVerdicts();
   const lenses = new DryRunLenses();
   DryRunPanel.inline = inline;
+  engines = new EngineManager(context);
+  DryRunPanel.engines = engines;
   context.subscriptions.push(collection, inline);
   registerAssistProviders(context);
 
@@ -178,14 +188,14 @@ export function activate(context: vscode.ExtensionContext): void {
       if (editor) lintDocument(editor.document, collection);
     }),
     vscode.commands.registerCommand("ottl.dryRun", async () => {
-      if (await ensureEngine(context)) DryRunPanel.show(context);
+      if (await ensureEngine()) DryRunPanel.show(context);
     }),
     vscode.commands.registerCommand("ottl.dryRunAt", async (uri: vscode.Uri, line: number) => {
       // Put the cursor in the chosen block, then open the panel and run it right away.
       const editor = await vscode.window.showTextDocument(uri, { preserveFocus: false, preview: false });
       const pos = new vscode.Position(line, 0);
       editor.selection = new vscode.Selection(pos, pos);
-      if (await ensureEngine(context)) DryRunPanel.show(context, { autoRun: true });
+      if (await ensureEngine()) DryRunPanel.show(context, { autoRun: true });
     }),
     vscode.commands.registerCommand("ottl.clearVerdicts", () => {
       const editor = vscode.window.activeTextEditor;

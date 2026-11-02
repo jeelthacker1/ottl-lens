@@ -7,8 +7,15 @@
  *                                  signature line, description, "Examples:" list
  *   contexts/<ctx>/README.md     "| path | field accessed | type |" tables and enum tables
  *
+ *   processor READMEs            component-specific functions (`--component name=README.md`):
+ *                                  `### <name>` followed by a `name(args)` signature line
+ *   --history <dir>              ottlfuncs-vX.Y.Z.md / xottl-… / transform-… / filter-… for each
+ *                                  engine version → FUNCTION_SINCE / FUNCTION_REMOVED_IN, so the
+ *                                  dry-run can say "added in vX" for the engine the user picked
+ *
  * Usage:
  *   node scripts/gen-catalog.mjs <contrib>/pkg/ottl [--engine <README.md> --engine-version vX.Y.Z]
+ *     [--component transform=<README.md>] [--component filter=<README.md>] [--history <dir>]
  *
  * --engine points at ottlfuncs/README.md from the SAME contrib version the bundled
  * WASM engine is built with (see wasm/go.mod). The catalog is the union of both, so
@@ -22,7 +29,7 @@
  *   git show v0.146.0:pkg/ottl/ottlfuncs/README.md > /tmp/ottlfuncs-v0.146.0.md
  */
 
-import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, readdirSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
@@ -45,6 +52,7 @@ if (!existsSync(funcsReadme)) {
   console.error(`not found: ${funcsReadme}`);
   process.exit(2);
 }
+const flags = (name) => args.flatMap((a, i) => (a === name && args[i + 1] ? [args[i + 1]] : []));
 const engineReadme = flag("--engine");
 const engineVersion = flag("--engine-version") ?? "unknown";
 
@@ -196,15 +204,122 @@ if (existsSync(gatesDoc)) {
   }
 }
 
+/* Component-scoped functions (transform: metric conversions, ParseCEF…; filter: HasAttr…). */
+const COMPONENT_DOC_URL = {
+  transform: "https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/transformprocessor/README.md",
+  filter: "https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/filterprocessor/README.md",
+};
+function parseComponentFunctions(text, component) {
+  const lines = text.split(/\r?\n/);
+  const out = {};
+  for (let i = 0; i < lines.length; i++) {
+    const h3 = /^#{3,4}\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*$/.exec(lines[i]);
+    if (!h3) continue;
+    const name = h3[1];
+    // The signature line is the first line of the section, or follows a short note/warning.
+    const sigRe = new RegExp("^`{1,3}(" + name + "\\(.*?\\))`{1,3}\\s*$");
+    let j = i + 1;
+    let sig = null;
+    for (; j < Math.min(lines.length, i + 10); j++) {
+      if (/^#{1,4}\s/.test(lines[j])) break;
+      sig = sigRe.exec(lines[j].trim());
+      if (sig) break;
+    }
+    if (!sig) continue;
+    const paras = [];
+    let buf = [];
+    for (let k = j + 1; k < lines.length; k++) {
+      const t = lines[k].trim();
+      if (/^#{1,4}\s/.test(t) || EXAMPLES_MARKER.test(t)) break;
+      if (!t || t.startsWith("|") || /^[-*]\s/.test(t) || FENCE.test(t)) { if (buf.length) { paras.push(buf.join(" ")); buf = []; } if (paras.length >= 2) break; continue; }
+      buf.push(t);
+    }
+    if (buf.length) paras.push(buf.join(" "));
+    const exStart = lines.slice(j).findIndex((l) => EXAMPLES_MARKER.test(l.trim()));
+    const examples = [];
+    if (exStart >= 0) {
+      for (const l of lines.slice(j + exStart + 1)) {
+        if (/^#{1,4}\s/.test(l)) break;
+        const m = /^\s*[-*]\s+`(.+?)`(\s.*)?$/.exec(l);
+        if (m) examples.push(m[1]);
+        if (examples.length === 3) break;
+      }
+    }
+    const base = COMPONENT_DOC_URL[component] ?? "";
+    out[name] = {
+      name,
+      kind: /^[A-Z]/.test(name) ? "converter" : "editor",
+      signature: sig[1],
+      summary: absolutizeLinks(paras[0] ?? "", base),
+      details: absolutizeLinks(paras[1] ?? "", base),
+      examples,
+      anchor: anchor(name),
+      component,
+    };
+  }
+  return out;
+}
+const componentDocs = {};
+for (const spec of flags("--component")) {
+  const [component, file] = spec.split("=");
+  const found = parseComponentFunctions(readFileSync(file, "utf8"), component);
+  if (Object.keys(found).length === 0) problems.push(`[component ${component}] no functions parsed`);
+  for (const [n, d] of Object.entries(found)) if (!componentDocs[n]) componentDocs[n] = d;
+}
+
+/* Per-version function sets → when each function appeared / disappeared. */
+const historyDir = flag("--history");
+const since = {};
+const removedIn = {};
+const historyDocs = {};
+let historyVersions = [];
+if (historyDir) {
+  const files = readdirSync(historyDir);
+  const vparse = (v) => v.slice(1).split(".").map(Number);
+  const vcmp = (a, b) => { const x = vparse(a), y = vparse(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; };
+  historyVersions = [...new Set(files.map((f) => /-(v\d+\.\d+\.\d+)\.md$/.exec(f)?.[1]).filter(Boolean))].sort(vcmp);
+  const namesAt = {};
+  for (const v of historyVersions) {
+    const names = new Set();
+    const read = (f) => (existsSync(join(historyDir, f)) ? readFileSync(join(historyDir, f), "utf8") : null);
+    const funcs = read(`ottlfuncs-${v}.md`);
+    if (funcs) { const r = parseFunctions(funcs, `history ${v}`); for (const n of [...r.editors, ...r.converters]) { names.add(n); historyDocs[n] = r.docs[n]; } }
+    const x = read(`xottl-${v}.md`);
+    if (x) { const r = parseFunctions(x, `history xottl ${v}`, { requireBoth: false }); for (const n of [...r.editors, ...r.converters]) names.add(n); }
+    for (const c of ["transform", "filter"]) {
+      const t = read(`${c}-${v}.md`);
+      if (t) for (const n of Object.keys(parseComponentFunctions(t, c))) names.add(n);
+    }
+    namesAt[v] = names;
+  }
+  const all = new Set(historyVersions.flatMap((v) => [...namesAt[v]]));
+  // Documented elsewhere now, but still registered (moved to pkg/ottl/contexts/xprofile docs).
+  const MOVED_NOT_REMOVED = new Set(["ProfileID"]);
+  for (const n of all) {
+    if (MOVED_NOT_REMOVED.has(n)) continue;
+    const first = historyVersions.find((v) => namesAt[v].has(n));
+    if (first !== historyVersions[0]) since[n] = first;
+    const lastIdx = historyVersions.map((v) => namesAt[v].has(n)).lastIndexOf(true);
+    if (lastIdx < historyVersions.length - 1) removedIn[n] = historyVersions[lastIdx + 1];
+  }
+}
+
 const mainNames = new Set([...main.editors, ...main.converters, ...(xottl ? [...xottl.editors, ...xottl.converters] : [])]);
 const engineNames = engine ? new Set([...engine.editors, ...engine.converters]) : mainNames;
 
-const editors = new Set([...main.editors, ...(engine?.editors ?? []), ...(xottl?.editors ?? [])]);
-const converters = new Set([...main.converters, ...(engine?.converters ?? []), ...(xottl?.converters ?? [])]);
-const docs = { ...(engine?.docs ?? {}), ...(xottl?.docs ?? {}), ...main.docs }; // latest wording wins
+// Functions removed upstream stay known (so the linter can point at the replacement).
+const removedNames = Object.keys(removedIn).filter((n) => historyDocs[n] && !mainNames.has(n));
+const editors = new Set([...main.editors, ...(engine?.editors ?? []), ...(xottl?.editors ?? []),
+  ...Object.values(componentDocs).filter((d) => d.kind === "editor").map((d) => d.name),
+  ...removedNames.filter((n) => historyDocs[n].kind === "editor")]);
+const converters = new Set([...main.converters, ...(engine?.converters ?? []), ...(xottl?.converters ?? []),
+  ...Object.values(componentDocs).filter((d) => d.kind === "converter").map((d) => d.name),
+  ...removedNames.filter((n) => historyDocs[n].kind === "converter")]);
+const removedDocs = Object.fromEntries(removedNames.map((n) => [n, historyDocs[n]]));
+const docs = { ...removedDocs, ...(engine?.docs ?? {}), ...componentDocs, ...(xottl?.docs ?? {}), ...main.docs }; // latest wording wins
 for (const [name, gate] of Object.entries(experimental)) if (docs[name]) docs[name].featureGate = gate;
 const notInEngine = [...mainNames].filter((n) => !engineNames.has(n));
-const removedUpstream = [...engineNames].filter((n) => !mainNames.has(n));
+const removedUpstream = [...new Set([...[...engineNames].filter((n) => !mainNames.has(n)), ...removedNames])];
 
 /* ------------------------------------------------------------------ *
  * Context paths and enums
@@ -324,6 +439,8 @@ export interface FunctionDoc {
   anchor: string;
   /** Experimental (xottl) functions: the feature gate that must be enabled. */
   featureGate?: string;
+  /** Component-scoped functions (not in pkg/ottl): the component that provides them. */
+  component?: "transform" | "filter";
 }
 
 export interface FeatureGate {
@@ -340,6 +457,18 @@ export const FEATURE_GATES: Readonly<Record<string, FeatureGate>> = ${JSON.strin
 export const EXPERIMENTAL_FUNCTIONS: Readonly<Record<string, string>> = ${JSON.stringify(Object.fromEntries(sort(Object.keys(experimental)).map((k) => [k, experimental[k]])), null, 2)};
 
 export const XOTTL_DOC_URL = ${JSON.stringify(`${REPO}/xottl/ottlfuncs/README.md`)};
+
+/** Docs for component-scoped functions, by component. */
+export const COMPONENT_DOC_URL: Readonly<Record<string, string>> = ${JSON.stringify(COMPONENT_DOC_URL, null, 2)};
+
+/** Engine versions the history below was computed from (oldest first). */
+export const HISTORY_VERSIONS: readonly string[] = ${JSON.stringify(historyVersions)};
+
+/** First engine version that has the function (omitted: present in every version above). */
+export const FUNCTION_SINCE: Readonly<Record<string, string>> = ${JSON.stringify(Object.fromEntries(sort(Object.keys(since)).map((k) => [k, since[k]])), null, 2)};
+
+/** First engine version that no longer has the function. */
+export const FUNCTION_REMOVED_IN: Readonly<Record<string, string>> = ${JSON.stringify(Object.fromEntries(sort(Object.keys(removedIn)).map((k) => [k, removedIn[k]])), null, 2)};
 
 export const FUNCTION_DOCS: Readonly<Record<string, FunctionDoc>> = ${JSON.stringify(docsSorted, null, 2)};
 

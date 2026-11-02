@@ -5,7 +5,7 @@
  * mistakes (unknown/mis-cased functions, unbalanced delimiters, single `=`,
  * unterminated strings, empty `where`) locally so they don't surface only at
  * collector runtime. For accurate, engine-level validation the extension ships a
- * separate WASM dry-run (see wasm/ and src/ottl/wasmRunner.ts) that executes
+ * separate WASM dry-run (see wasm/ and src/ottl/engineHost.ts) that executes
  * statements with the real Go OTTL engine; this linter stays lightweight and
  * never invokes it.
  *
@@ -14,7 +14,7 @@
 
 import { KNOWN_FUNCTIONS, CASEFOLD_INDEX } from "./catalog";
 import { EXTRA_KNOWN, REMOVED_REPLACEMENTS } from "./extras";
-import { REMOVED_UPSTREAM, EXPERIMENTAL_FUNCTIONS, FEATURE_GATES } from "./catalog";
+import { REMOVED_UPSTREAM, EXPERIMENTAL_FUNCTIONS, FEATURE_GATES, FUNCTION_DOCS } from "./catalog";
 import { checkTypes, type Fix } from "./typecheck";
 import { segmentsAfter, suggestSegment } from "./explain";
 
@@ -270,6 +270,67 @@ function checkEmptyWhere(masked: string, line: number, diags: Diagnostic[]): voi
   }
 }
 
+/** Positions of list (slice) parameters in a signature, e.g. keep_keys(target, keys[]) → [1]. */
+export function sliceParams(signature: string): { index: number; name: string }[] {
+  const inner = /^\w+\((.*)\)$/.exec(signature)?.[1];
+  if (!inner) return [];
+  return inner.split(",").map((p) => p.trim()).flatMap((p, index) => {
+    const m = /^(?:\[\](\w+)|(\w+)\[\])$/.exec(p);
+    return m ? [{ index, name: m[1] ?? m[2] }] : [];
+  });
+}
+
+/** Top-level arguments of the call whose "(" is at `open`: [start, end) column pairs. */
+function callArguments(masked: string, open: number): [number, number][] {
+  const out: [number, number][] = [];
+  let depth = 0;
+  let start = open + 1;
+  for (let i = open; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch === "(" || ch === "[" || ch === "{") { if (depth++ === 0) start = i + 1; continue; }
+    if (ch === ")" || ch === "]" || ch === "}") {
+      if (--depth === 0) { out.push([start, i]); return out; }
+      continue;
+    }
+    if (ch === "," && depth === 1) { out.push([start, i]); start = i + 1; }
+  }
+  return [];
+}
+
+/**
+ * A plain value where a function takes a list — keep_keys(log.attributes, "a"). The
+ * parser rejects it, so the collector won't start (verified on v0.146.0 and v0.164.1).
+ */
+function checkSliceArguments(masked: string, raw: string, line: number, diags: Diagnostic[]): void {
+  const re = /([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(masked)) !== null) {
+    const doc = FUNCTION_DOCS[m[1]];
+    if (!doc) continue;
+    const slots = sliceParams(doc.signature);
+    if (slots.length === 0) continue;
+    const args = callArguments(masked, m.index + m[0].length - 1);
+    for (const { index, name } of slots) {
+      const span = args[index];
+      if (!span) continue;
+      const text = raw.slice(span[0], span[1]);
+      const lead = text.length - text.trimStart().length;
+      const value = text.trim();
+      if (!/^(".*"|-?\d+(\.\d+)?|true|false)$/.test(value)) continue;
+      const start = span[0] + lead;
+      diags.push({
+        line,
+        startCol: start,
+        endCol: start + value.length,
+        message: `"${m[1]}" expects a list for ${name} — write [${value}]. A plain value is rejected when the collector loads the config.`,
+        severity: "error",
+        code: "ottl.sliceArgument",
+        fix: { title: `Wrap in a list: [${value}]`, start, end: start + value.length, replacement: `[${value}]` },
+      });
+    }
+  }
+}
+
 export interface LintOptions {
   /** Warn on functions not in the known OTTL catalog. Default true. */
   unknownFunctions?: boolean;
@@ -293,6 +354,7 @@ export function lint(text: string, opts: LintOptions = {}): Diagnostic[] {
     }
     checkDelimiters(masked, idx, diags);
     if (checkUnknownFns) checkFunctions(masked, raw, idx, diags);
+    checkSliceArguments(masked, raw, idx, diags);
     checkSingleEquals(masked, idx, diags);
     checkEmptyWhere(masked, idx, diags);
     checkPaths(masked, idx, diags);

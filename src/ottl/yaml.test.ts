@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractOTTL, collectStatementsForDryRun, stripOttlComments, editableInPlace, dryRunTargets, ottlFileStatementLines } from "./yaml";
+import { extractOTTL, collectStatementsForDryRun, stripOttlComments, editableInPlace, dryRunTargets, ottlFileStatementLines, configIssues } from "./yaml";
 
 describe("extractOTTL — transform processor", () => {
   it("extracts advanced-style statements with context + signal + position", () => {
@@ -292,5 +292,28 @@ describe("dry-run targets and statement lines", () => {
       { line: 2, text: 'set(log.body, "a")' },
       { line: 3, text: "keep_keys(log.attributes, [])" },
     ]);
+  });
+});
+
+describe("configIssues (transform processor settings)", () => {
+  it("flags the deprecated flatten_data with a fix", () => {
+    const yaml = "processors:\n  transform/x:\n    flatten_data: true\n    log_statements: []\n";
+    const [i] = configIssues(yaml);
+    expect(i).toMatchObject({ line: 2, startCol: 4, endCol: 22, severity: "warning", code: "ottl.deprecatedFlattenData" });
+    expect(i.fix).toEqual({ title: "Replace with flatten: { log: true }", replacement: "flatten: { log: true }" });
+    expect(yaml.split("\n")[2].slice(i.startCol, i.endCol)).toBe("flatten_data: true");
+  });
+
+  it("is an error when both flatten_data and flatten.log are set", () => {
+    const [i] = configIssues("processors:\n  transform:\n    flatten_data: true\n    flatten:\n      log: true\n");
+    expect(i).toMatchObject({ severity: "error", code: "ottl.flattenBoth" });
+    expect(i.fix).toBeUndefined();
+  });
+
+  it("ignores other processors and documents without processors", () => {
+    expect(configIssues("processors:\n  batch:\n    flatten_data: true\n")).toEqual([]);
+    expect(configIssues("receivers: {}\n")).toEqual([]);
+    expect(configIssues("processors:\n  transform:\n    flatten:\n      log: true\n")).toEqual([]);
+    expect(configIssues(": : :\n  - [")).toEqual([]);
   });
 });

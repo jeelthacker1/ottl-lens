@@ -2,7 +2,7 @@
   "name": "ottl-lens",
   "displayName": "OTTL Lens (community)",
   "description": "Per-statement dry-run with the real OTTL engine, hover docs, autocomplete and linting for the OpenTelemetry Transformation Language (OTTL) in Collector YAML. Community project, not affiliated with or endorsed by the OpenTelemetry project or CNCF.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "srikar-kompella",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -75,7 +75,10 @@
     ],
     "menus": {
       "commandPalette": [
-        { "command": "ottl.dryRunAt", "when": "false" }
+        {
+          "command": "ottl.dryRunAt",
+          "when": "false"
+        }
       ]
     },
     "configuration": {
@@ -90,6 +93,43 @@
           "type": "boolean",
           "default": true,
           "description": "Show a \"▶ Dry-run\" button above each runnable transform block and at the top of .ottl files."
+        },
+        "ottl.collectorVersion": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "v0.164.1",
+            "v0.163.0",
+            "v0.161.0",
+            "v0.160.0",
+            "v0.157.0",
+            "v0.153.0",
+            "v0.150.0",
+            "v0.146.0",
+            "v0.140.0"
+          ],
+          "enumDescriptions": [
+            "Use the version pinned in your workspace (compose file, Helm values, Dockerfile, go.mod) if one is found, otherwise the latest.",
+            "Latest, bundled (OTTL 1.x stable)",
+            "Slice arguments accept paths and converters",
+            "set() writes nil as an empty value; failed conversions are errors",
+            "Failed conversions (Int(\"abc\")) became errors; clear() added",
+            "Failed conversions still return nil",
+            "Transform default error_mode became ignore",
+            "Hex strings assigned to trace_id/span_id became errors",
+            "The engine OTTL Lens 0.1–0.3 bundled",
+            "Before severity_number string assignments became errors"
+          ],
+          "markdownDescription": "Which collector version's OTTL engine runs the dry-run. Versions other than the bundled one are downloaded once, on request, from this extension's GitHub releases and verified against a checksum built into the extension."
+        },
+        "ottl.dryRun.featureGates": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Collector feature gates to enable in the dry-run, as you would pass them with `--feature-gates` — for example `ottl.functions.enableLambda` to run the experimental lambda functions (`Filter`, `MapEach`, …)."
         }
       }
     }

@@ -220,7 +220,7 @@ export function displayValue(v: unknown, leafKind?: string): string {
   const inner = isRecord(v) && "key" in v && "value" in v ? v.value : v;
   if (isRecord(inner)) {
     const kind = kindOf(inner);
-    if (kind === "empty") return "nil";
+    if (kind === "empty") return "(empty)";
     if (kind === "stringValue") return JSON.stringify(inner.stringValue);
     if (kind) return truncate(JSON.stringify(anyToRaw(inner)));
     return truncate(JSON.stringify(inner));

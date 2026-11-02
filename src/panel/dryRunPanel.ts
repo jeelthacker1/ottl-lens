@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
-import { evalOTTL } from "../ottl/wasmRunner";
+import type { EngineManager } from "../engineManager";
+import { BUNDLED_ENGINE, ENGINES, engineLabel, findEngine } from "../ottl/engines";
+import { closestEngine, detectCollectorVersions } from "../ottl/versions";
+import { compareTraces } from "../ottl/compare";
 import { collectStatementsForDryRun, ottlFileStatementLines, type StatementLine } from "../ottl/yaml";
-import { traceStatements, summarize, isErrorMode, DEFAULT_ERROR_MODE_NOTE, type ErrorMode } from "../ottl/trace";
+import { traceStatements, summarize, isErrorMode, defaultErrorModeNote, type ErrorMode } from "../ottl/trace";
 import { SAMPLES, samplePayloadText } from "../ottl/samples";
 import { normalizePayloadInput, describeConversion } from "../ottl/payload";
 import { mapVerdicts } from "../ottl/inline";
@@ -25,13 +28,23 @@ const MAX_FILE_BYTES = 5 * 1024 * 1024;
 
 type InboundMessage =
   | { type: "ready" }
-  | { type: "run"; signal?: string; payload?: string; errorMode?: string }
+  | { type: "run"; signal?: string; payload?: string; errorMode?: string; version?: string; compareWith?: string }
   | { type: "openFile" };
+
+/** A collector version pinned somewhere in the workspace. */
+interface Detected {
+  version: string;
+  file: string;
+  engine: string;
+}
 
 export class DryRunPanel {
   private static instance: DryRunPanel | undefined;
   /** Where inline verdicts are drawn (set once by the extension on activation). */
   static inline: InlineVerdicts | undefined;
+  /** Loads and downloads engines (set once by the extension on activation). */
+  static engines: EngineManager | undefined;
+  private detected: Detected | undefined;
   /** Run as soon as the webview has the statements (used by the ▶ CodeLens). */
   private pendingAutoRun = false;
   private currentItems: StatementLine[] = [];
@@ -61,10 +74,16 @@ export class DryRunPanel {
     this.panel.webview.onDidReceiveMessage(
       (msg: InboundMessage) => {
         if (msg.type === "run") {
-          this.handleRun(msg.signal ?? "logs", msg.payload ?? "", isErrorMode(msg.errorMode) ? msg.errorMode : "ignore");
+          void this.handleRun(
+            msg.signal ?? "logs", msg.payload ?? "", isErrorMode(msg.errorMode) ? msg.errorMode : "ignore",
+            findEngine(msg.version ?? "") ? msg.version! : BUNDLED_ENGINE,
+            findEngine(msg.compareWith ?? "") ? msg.compareWith : undefined,
+          ).catch((e) => this.post({ type: "result", ok: false, error: e instanceof Error ? e.message : String(e) }));
         } else if (msg.type === "ready") {
           this.pushStatements();
-          if (this.pendingAutoRun) { this.pendingAutoRun = false; this.post({ type: "runNow" }); }
+          void this.pushEngines().then(() => {
+            if (this.pendingAutoRun) { this.pendingAutoRun = false; this.post({ type: "runNow" }); }
+          });
         } else if (msg.type === "openFile") {
           void this.openPayloadFile();
         }
@@ -135,7 +154,20 @@ export class DryRunPanel {
     void this.panel.webview.postMessage({ type: "statements", text, filename, signal, errorMode: configErrorMode, fromYaml });
   }
 
-  private handleRun(selectedSignal: string, payloadText: string, errorMode: ErrorMode): void {
+  /** Tell the webview which collector versions it can pick, and which one to preselect. */
+  private async pushEngines(): Promise<void> {
+    const engines = DryRunPanel.engines;
+    if (!this.detected) this.detected = await detectWorkspaceVersion();
+    const setting = vscode.workspace.getConfiguration("ottl").get<string>("collectorVersion", "auto");
+    const selected = findEngine(setting) ? setting : this.detected?.engine ?? BUNDLED_ENGINE;
+    const options = [...ENGINES].reverse().map((e) => ({
+      version: e.version,
+      label: engineLabel(e, engines?.isLocal(e.version) ?? e.version === BUNDLED_ENGINE),
+    }));
+    this.post({ type: "engines", options, selected, detected: this.detected, fromSetting: !!findEngine(setting) });
+  }
+
+  private async handleRun(selectedSignal: string, payloadText: string, errorMode: ErrorMode, version: string, compareWith: string | undefined): Promise<void> {
     // Re-collect in case the cursor moved to a different block since the last push.
     const fresh = this.collectInput(vscode.window.activeTextEditor);
     const statements = fresh.text || this.currentStatements;
@@ -173,7 +205,7 @@ export class DryRunPanel {
         `Statements written for ${blockSignal} will not find ${blockSignal} fields in ${signal} data.`
       );
     }
-    if (fromYaml && !blockErrorMode) notes.push(DEFAULT_ERROR_MODE_NOTE);
+    if (fromYaml && !blockErrorMode) notes.push(defaultErrorModeNote(version));
     if (fromYaml && blockErrorMode && !isErrorMode(blockErrorMode)) {
       notes.push(`\`error_mode: ${blockErrorMode}\` isn't a valid value — use ignore, propagate or silent. The collector would reject this config.`);
     }
@@ -184,9 +216,32 @@ export class DryRunPanel {
       this.post({ type: "payload", json: input.json, signal });
     }
 
+    const manager = DryRunPanel.engines;
+    if (!manager) throw new Error("The OTTL engine manager isn't ready.");
+    const engine = await manager.get(version);
+    if (!engine) {
+      this.post({ type: "result", ok: false, error: `The engine for collector ${version} isn't available. Pick another version, or allow the download.` });
+      return;
+    }
+    const gates = vscode.workspace.getConfiguration("ottl").get<string[]>("dryRun.featureGates", []) ?? [];
+    notes.push(...manager.applyFeatureGates(engine, gates));
+    if (gates.length) notes.push(`Feature gates enabled for this dry-run: ${gates.map((g) => "`" + g + "`").join(", ")}.`);
+
     const started = Date.now();
-    const trace = traceStatements(statements, signal, input.json, evalOTTL, errorMode);
+    const trace = traceStatements(statements, signal, input.json, (s, sig, p) => engine.eval(s, sig, p), errorMode, { engineVersion: version });
     const executionMs = Date.now() - started;
+
+    let comparison: ReturnType<typeof compareTraces> | undefined;
+    if (compareWith && compareWith !== version) {
+      const other = await manager.get(compareWith);
+      if (other) {
+        notes.push(...manager.applyFeatureGates(other, gates));
+        const otherTrace = traceStatements(statements, signal, input.json, (s, sig, p) => other.eval(s, sig, p), errorMode, { engineVersion: compareWith });
+        comparison = compareTraces(trace, otherTrace, version, compareWith);
+      } else {
+        notes.push(`Couldn't compare: the engine for collector ${compareWith} isn't available.`);
+      }
+    }
 
     if (trace.error) {
       this.post({ type: "result", ok: false, error: trace.error, notes });
@@ -213,7 +268,10 @@ export class DryRunPanel {
       output: trace.finalOutput ? prettyJSON(trace.finalOutput) : undefined,
       executionMs,
       notes,
+      engineVersion: version,
+      comparison,
     });
+    if (compareWith || !manager.isLocal(version)) void this.pushEngines(); // refresh "(download…)" labels
   }
 
   /** Load a payload from disk: OTLP JSON, file-exporter JSON Lines, or saved debug output. */
@@ -260,6 +318,37 @@ export class DryRunPanel {
     this.disposables.forEach(d => d.dispose());
     this.disposables = [];
   }
+}
+
+/**
+ * Look for a collector-contrib version pinned in the workspace (compose files, Helm values,
+ * Kubernetes manifests, Dockerfiles, go.mod). The first match wins; reads small files only.
+ */
+async function detectWorkspaceVersion(): Promise<Detected | undefined> {
+  if (!vscode.workspace.workspaceFolders?.length) return undefined;
+  const files = await vscode.workspace.findFiles(
+    "**/{*compose*.yml,*compose*.yaml,values*.yaml,values*.yml,Dockerfile*,go.mod,*.yaml,*.yml}",
+    "**/{node_modules,.git,vendor,dist,out}/**",
+    300,
+  );
+  const engines = ENGINES.map((e) => e.version);
+  // Most specific files first: compose, Helm values, Dockerfile, go.mod, then any YAML.
+  const rank = (u: vscode.Uri) => {
+    const n = u.path.split("/").pop() ?? "";
+    return /compose/.test(n) ? 0 : /^values/.test(n) ? 1 : /^Dockerfile/.test(n) ? 2 : n === "go.mod" ? 3 : 4;
+  };
+  for (const uri of files.sort((a, b) => rank(a) - rank(b))) {
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.size > 256 * 1024) continue;
+      const text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
+      const found = detectCollectorVersions(text)[0];
+      if (found) {
+        return { version: found, file: vscode.workspace.asRelativePath(uri), engine: closestEngine(found, engines) ?? BUNDLED_ENGINE };
+      }
+    } catch { /* unreadable: skip */ }
+  }
+  return undefined;
 }
 
 function prettyJSON(json: string): string {
@@ -398,6 +487,16 @@ export function buildHtml(): string {
     background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
   }
   .step.changed     { border-left-color: #3fb950; }
+  .step.caution     { border-left-color: #d29922; }
+  #version-source { font-size: 0.78em; color: var(--vscode-descriptionForeground); }
+  #compare-box { display: none; margin-bottom: 8px; padding: 6px 8px; border-radius: 2px; font-size: 0.82em;
+    border: 1px solid var(--vscode-panel-border); border-left: 3px solid #a371f7;
+    background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background)); }
+  #compare-box .cmp-head { font-weight: 600; margin-bottom: 4px; }
+  #compare-box .cmp-row { margin: 4px 0; }
+  #compare-box .cmp-stmt { font-family: var(--vscode-editor-font-family); word-break: break-word; }
+  #compare-box .cmp-side { margin-left: 1.2em; word-break: break-word; }
+  #compare-box .cmp-ver { font-weight: 600; }
   .step.no-effect   { border-left-color: #d29922; }
   .step.not-matched { border-left-color: #8b949e; }
   .step.error       { border-left-color: #f85149; }
@@ -412,6 +511,7 @@ export function buildHtml(): string {
     padding: 1px 6px; border-radius: 8px; white-space: nowrap; font-weight: 600;
   }
   .badge.changed     { background: rgba(63,185,80,0.18);  color: #3fb950; }
+  .badge.caution     { background: rgba(210,153,34,0.18); color: #d29922; }
   .badge.no-effect   { background: rgba(210,153,34,0.18); color: #d29922; }
   .badge.not-matched { background: rgba(139,148,158,0.2); color: #8b949e; }
   .badge.error       { background: rgba(248,81,73,0.18);  color: #f85149; }
@@ -453,6 +553,13 @@ export function buildHtml(): string {
     </select>
   </label>
   <span id="mode-source"></span>
+  <label>Collector:
+    <select id="version" title="Which collector version's OTTL engine runs the dry-run. Behaviour differs between versions."></select>
+  </label>
+  <label>Compare with:
+    <select id="compare" title="Run the same block on a second version and show what changes"><option value="">—</option></select>
+  </label>
+  <span id="version-source"></span>
   <button id="run-btn">▶ Run</button>
   <span id="exec-time"></span>
 </div>
@@ -479,6 +586,7 @@ export function buildHtml(): string {
     <div class="pane-label">What each statement did</div>
     <div id="error-box"></div>
     <div id="notes"></div>
+    <div id="compare-box"></div>
     <div id="summary"></div>
     <div class="tabs">
       <button class="tab active" id="tab-trace">Per-statement</button>
@@ -514,6 +622,12 @@ const statementsEmpty = document.getElementById('statements-empty');
 const filenameEl = document.getElementById('filename');
 const tabTrace = document.getElementById('tab-trace');
 const tabOutput = document.getElementById('tab-output');
+const versionEl = document.getElementById('version');
+const compareEl = document.getElementById('compare');
+const versionSourceEl = document.getElementById('version-source');
+const compareBox = document.getElementById('compare-box');
+versionEl.addEventListener('change', () => { versionSourceEl.textContent = ''; clearOutput(); });
+compareEl.addEventListener('change', () => clearOutput());
 
 let lastStatements = null;
 
@@ -655,17 +769,18 @@ function renderTrace(steps) {
     return;
   }
   for (const s of steps) {
-    const card = el('div', 'step ' + s.verdict);
+    const kind = s.verdict === 'changed' && s.caution ? 'caution' : s.verdict;
+    const card = el('div', 'step ' + kind);
     const head = el('div', 'step-head');
     head.appendChild(el('span', 'step-num', '#' + (s.index + 1)));
     head.appendChild(el('span', 'step-stmt', s.statement));
-    head.appendChild(el('span', 'badge ' + s.verdict, VERDICT_LABEL[s.verdict] || s.verdict));
+    head.appendChild(el('span', 'badge ' + kind, kind === 'caution' ? 'wrote empty value' : (VERDICT_LABEL[s.verdict] || s.verdict)));
     card.appendChild(head);
     if (s.verdict === 'changed') {
       const rows = diffRows(s);
       if (rows.length) card.appendChild(renderDiff(rows));
     }
-    if (s.note) card.appendChild(richEl('div', 'step-note ' + (s.verdict === 'no-effect' ? 'warn' : ''), s.note));
+    if (s.note) card.appendChild(richEl('div', 'step-note ' + (s.verdict === 'no-effect' || s.caution ? 'warn' : ''), s.note));
     if (s.explanation) card.appendChild(richEl('div', 'step-note explain', s.explanation));
     if (s.consequence) card.appendChild(el('div', 'step-note danger', s.consequence));
     if (s.error) {
@@ -683,7 +798,26 @@ function renderTrace(steps) {
   }
 }
 
+function renderComparison(c) {
+  compareBox.innerHTML = '';
+  if (!c) { compareBox.style.display = 'none'; return; }
+  compareBox.style.display = 'block';
+  compareBox.appendChild(el('div', 'cmp-head', c.summary));
+  for (const d of c.differences) {
+    const row = el('div', 'cmp-row');
+    row.appendChild(el('div', 'cmp-stmt', '#' + (d.index + 1) + '  ' + d.statement));
+    for (const [ver, o] of [[c.versionA, d.a], [c.versionB, d.b]]) {
+      const side = el('div', 'cmp-side');
+      side.appendChild(el('span', 'cmp-ver', ver + ': '));
+      side.appendChild(richEl('span', '', o.verdict + (o.detail ? ' — ' + o.detail : '')));
+      row.appendChild(side);
+    }
+    compareBox.appendChild(row);
+  }
+}
+
 function clearOutput() {
+  renderComparison(null);
   traceEl.innerHTML = '<span id="placeholder">Click ▶ Run to see what each statement actually does.</span>';
   outputEl.textContent = '';
   summaryEl.textContent = '';
@@ -700,7 +834,9 @@ runBtn.addEventListener('click', () => {
     type: 'run',
     signal: signalEl.value,
     payload: payloadEl.value,
-    errorMode: errorModeEl.value
+    errorMode: errorModeEl.value,
+    version: versionEl.value,
+    compareWith: compareEl.value
   });
 });
 
@@ -733,6 +869,26 @@ window.addEventListener('message', (event) => {
       }
     }
     lastStatements = msg.text;
+    return;
+  }
+
+  if (msg.type === 'engines') {
+    const keepVersion = versionEl.value, keepCompare = compareEl.value;
+    versionEl.innerHTML = '';
+    compareEl.innerHTML = '';
+    compareEl.appendChild(Object.assign(el('option', '', '—'), { value: '' }));
+    for (const o of msg.options) {
+      versionEl.appendChild(Object.assign(el('option', '', o.label), { value: o.version }));
+      compareEl.appendChild(Object.assign(el('option', '', o.label), { value: o.version }));
+    }
+    // First push: preselect from the setting / workspace; later pushes keep the user's choice.
+    versionEl.value = keepVersion || msg.selected;
+    compareEl.value = keepCompare;
+    if (!keepVersion) {
+      versionSourceEl.textContent = msg.fromSetting ? 'from settings'
+        : msg.detected ? 'found ' + msg.detected.version + ' in ' + msg.detected.file + (msg.detected.engine !== msg.detected.version ? ' → closest engine ' + msg.detected.engine : '')
+        : '';
+    }
     return;
   }
 
@@ -770,11 +926,13 @@ window.addEventListener('message', (event) => {
     }
 
     errorBox.style.display = 'none';
+    renderComparison(msg.comparison);
     renderTrace(msg.steps);
     outputEl.textContent = msg.output ?? '(no output — the block did not run to completion)';
 
     summaryEl.innerHTML = '';
     summaryEl.appendChild(el('strong', '', msg.summary ?? ''));
+    if (msg.engineVersion) summaryEl.appendChild(document.createTextNode(' · collector ' + msg.engineVersion));
     if (msg.noEffectCount > 0) {
       summaryEl.appendChild(document.createTextNode(
         ' — ' + msg.noEffectCount + ' statement' + (msg.noEffectCount === 1 ? '' : 's') +

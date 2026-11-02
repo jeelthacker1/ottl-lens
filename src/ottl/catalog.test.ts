@@ -2,13 +2,15 @@ import { describe, it, expect } from "vitest";
 import {
   EDITORS, CONVERTERS, KNOWN_FUNCTIONS, CASEFOLD_INDEX, FUNCTION_DOCS, CONTEXT_PATHS, ENUMS,
   NOT_IN_ENGINE, REMOVED_UPSTREAM, ENGINE_VERSION, EXPERIMENTAL_FUNCTIONS, FEATURE_GATES,
+  FUNCTION_SINCE, FUNCTION_REMOVED_IN, HISTORY_VERSIONS,
 } from "./catalog";
 
 describe("catalog", () => {
   it("has the expected editor and converter counts (regen if OTTL changes)", () => {
-    // Union of contrib main (2026-09-29) and the bundled engine's reference (v0.146.0).
-    expect(EDITORS.size).toBe(17);
-    expect(CONVERTERS.size).toBe(106); // incl. 8 experimental (xottl) lambda functions
+    // contrib v0.164.1: pkg/ottl + xottl (8 lambdas) + transform/filter processor functions
+    // + Base64Decode (removed in v0.161, kept so the linter can point at Decode).
+    expect(EDITORS.size).toBe(33);
+    expect(CONVERTERS.size).toBe(111);
   });
 
   it("includes known editors and converters", () => {
@@ -34,13 +36,18 @@ describe("catalog", () => {
 
 describe("catalog — version metadata (verified against the real engine)", () => {
   it("records the bundled engine version", () => {
-    expect(ENGINE_VERSION).toBe("v0.146.0");
+    expect(ENGINE_VERSION).toBe("v0.164.1");
   });
 
   it("lists functions the bundled engine rejects", () => {
-    expect([...NOT_IN_ENGINE].sort()).toEqual([
-      "All", "Any", "Base64Encode", "Coalesce", "Filter", "Find", "IsEmpty", "MapEach", "MapKeys", "Reduce", "When", "clear", "stringify_all",
-    ]);
+    // The bundled engine is the catalog's own release: nothing is missing from it.
+    expect([...NOT_IN_ENGINE]).toEqual([]);
+    // Per-version availability comes from the history instead (checked on the real engines).
+    expect(FUNCTION_SINCE.clear).toBe("v0.160.0");
+    expect(FUNCTION_SINCE.IsEmpty).toBe("v0.157.0");
+    expect(FUNCTION_REMOVED_IN.Base64Decode).toBe("v0.161.0");
+    expect(FUNCTION_SINCE.set).toBeUndefined();
+    expect(HISTORY_VERSIONS[0]).toBe("v0.140.0");
   });
 
   it("lists functions removed from the latest reference", () => {

@@ -26,6 +26,19 @@ processors:
           # ↓ silently drops "environment" — watch the removed line in the diff
           - keep_keys(log.attributes, ["env", "env.upper", "http.method"])
 
+  # --- transform: behaviour that depends on the collector version ---
+  #     Dry-run it, then pick an older version under "Compare with" (e.g. v0.157.0)
+  #     to see what changes when you upgrade.
+  transform/upgrade-check:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          # ↓ "team" isn't in the sample: nothing happens up to v0.160; from v0.161 "owner" is written as an empty value
+          - set(log.attributes["owner"], log.attributes["team"])
+          # ↓ the body isn't a number: Int() returns nil up to v0.159; from v0.160 it's a runtime error
+          - set(log.attributes["status"], Int(log.body))
+
   # --- transform: intentional mistakes — for the linter (do not dry-run) ---
   transform/lint-demo:
     error_mode: ignore
@@ -36,6 +49,7 @@ processors:
           - set(log.attributes["bad"] = "x")                 # ERROR: single '='
           - keep_keys(log.attributes, ["a", "b")             # ERROR: unbalanced ] vs )
           - set(log.body, "x") where log.severity_number == "9"   # WARN: can never match (int64 vs string) — quick fix: 9
+          - keep_keys(log.attributes, "http.method")         # ERROR: keep_keys needs a list — quick fix: ["http.method"]
 
   # --- filter: new style ---
   filter/drop-noise:

@@ -6,10 +6,11 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       // Pure, unit-testable logic only.
-      // extension.ts + wasmRunner.ts are VS Code/WASM host glue verified via F5
-      // (@vscode/test-electron would be needed for integration tests).
+      // extension.ts, engineManager.ts and the panel are VS Code glue verified via F5
+      // (@vscode/test-electron would be needed for integration tests). engineHost's
+      // network download is exercised by scripts/verify-engine.mjs, not unit tests.
       include: ["src/ottl/**"],
-      exclude: ["src/ottl/**/*.test.ts", "src/ottl/wasmRunner.ts"],
+      exclude: ["src/ottl/**/*.test.ts"],
       reporter: ["text", "text-summary"],
       thresholds: {
         statements: 90,

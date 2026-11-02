@@ -283,3 +283,56 @@ export function ottlFileStatementLines(text: string): StatementLine[] {
     return t ? [{ line, text: t }] : [];
   });
 }
+
+/** A problem in the Collector config around the OTTL (not in an OTTL string itself). */
+export interface ConfigIssue {
+  line: number;
+  startCol: number;
+  endCol: number;
+  message: string;
+  severity: "error" | "warning";
+  code: string;
+  fix?: { title: string; replacement: string };
+}
+
+/**
+ * Transform-processor settings that changed: `flatten_data` is deprecated in favour of
+ * `flatten: {log: true}` since v0.164.0, and setting both is a config error
+ * (processor/transformprocessor/config.go at v0.164.0).
+ */
+export function configIssues(yamlText: string): ConfigIssue[] {
+  const lc = new LineCounter();
+  let doc;
+  try {
+    doc = parseDocument(yamlText, { lineCounter: lc, keepSourceTokens: true });
+  } catch {
+    return [];
+  }
+  const out: ConfigIssue[] = [];
+  const processors = doc.get("processors");
+  if (!isMap(processors)) return out;
+  for (const pair of processors.items) {
+    const name = isScalar(pair.key) ? String(pair.key.value) : "";
+    if (!/^transform(\/|$)/.test(name) || !isMap(pair.value)) continue;
+    const proc = pair.value;
+    const flat = proc.items.find((p) => isScalar(p.key) && p.key.value === "flatten_data");
+    if (!flat || !isScalar(flat.key) || !flat.key.range) continue;
+    const flatten = proc.get("flatten");
+    const hasLog = isMap(flatten) && flatten.has("log");
+    const start = lc.linePos(flat.key.range[0]);
+    const valueEnd = isScalar(flat.value) && flat.value.range ? lc.linePos(flat.value.range[1]) : lc.linePos(flat.key.range[1]);
+    const endCol = valueEnd.line === start.line ? valueEnd.col - 1 : start.col - 1 + "flatten_data".length;
+    const value = isScalar(flat.value) ? String(flat.value.value) : "true";
+    out.push(hasLog
+      ? {
+        line: start.line - 1, startCol: start.col - 1, endCol, severity: "error", code: "ottl.flattenBoth",
+        message: "`flatten_data` and `flatten.log` cannot both be set — the collector (v0.164.0+) rejects this config. Keep only `flatten.log`.",
+      }
+      : {
+        line: start.line - 1, startCol: start.col - 1, endCol, severity: "warning", code: "ottl.deprecatedFlattenData",
+        message: "`flatten_data` is deprecated since collector v0.164.0 and will be removed. Use `flatten: { log: " + value + " }` (it still needs the `transform.flatten.logs` feature gate).",
+        fix: { title: `Replace with flatten: { log: ${value} }`, replacement: `flatten: { log: ${value} }` },
+      });
+  }
+  return out;
+}

@@ -11,14 +11,16 @@
  */
 
 import {
+  COMPONENT_DOC_URL,
   CONTEXT_PATHS,
   EDITORS,
-  ENGINE_VERSION,
   ENUMS,
   EXPERIMENTAL_FUNCTIONS,
   FUNCTION_DOCS,
+  FUNCTION_REMOVED_IN,
+  FUNCTION_SINCE,
   FUNCTIONS_DOC_URL,
-  NOT_IN_ENGINE,
+  HISTORY_VERSIONS,
   REMOVED_UPSTREAM,
   XOTTL_DOC_URL,
   type FunctionDoc,
@@ -139,14 +141,22 @@ function versionNotes(name: string): string[] {
   const notes: string[] = [];
   const gate = EXPERIMENTAL_FUNCTIONS[name];
   if (gate) {
-    notes.push(`🧪 Experimental — needs ${describeGate(gate)}. Enable it with \`--feature-gates=${gate}\`. [Experimental functions](${XOTTL_DOC_URL})`);
+    notes.push(`🧪 Experimental — needs ${describeGate(gate)}. Enable it with \`--feature-gates=${gate}\` on the collector, and in the dry-run with the \`ottl.dryRun.featureGates\` setting. [Experimental functions](${XOTTL_DOC_URL})`);
   }
-  if (NOT_IN_ENGINE.has(name)) {
-    notes.push(`⚠️ Added after ${ENGINE_VERSION}, the version the bundled dry-run engine is built from — it lints fine, but the dry-run can't execute it yet.`);
+  const component = FUNCTION_DOCS[name]?.component;
+  if (component) {
+    notes.push(`Provided by the ${component} processor only — not available in other components.`);
+  }
+  const since = FUNCTION_SINCE[name];
+  if (since) {
+    const i = HISTORY_VERSIONS.indexOf(since);
+    const before = i > 0 ? HISTORY_VERSIONS[i - 1] : undefined;
+    notes.push(`Available from collector ${before ? `releases after ${before} (first in ${since})` : since}.`);
   }
   if (REMOVED_UPSTREAM.has(name) && !EXTRA_KNOWN.has(name)) {
     const r = REMOVED_REPLACEMENTS[name];
-    notes.push(`⚠️ Removed from the latest OTTL${r ? ` — use \`${r}\` instead` : ""}. Still works on older collectors.`);
+    const when = FUNCTION_REMOVED_IN[name];
+    notes.push(`⚠️ Removed${when ? ` in ${when}` : " from the latest OTTL"}${r ? ` — use \`${r}\` instead` : ""}. Still works on older collectors.`);
   }
   return notes;
 }
@@ -164,7 +174,8 @@ export function functionMarkdown(name: string): string | undefined {
   if (doc.details) parts.push(doc.details);
   if (doc.examples.length) parts.push("**Examples**\n\n" + doc.examples.map((e) => "- `" + e + "`").join("\n"));
   parts.push(...versionNotes(name));
-  parts.push(`[OTTL function reference](${EXPERIMENTAL_FUNCTIONS[name] ? XOTTL_DOC_URL : FUNCTIONS_DOC_URL}#${doc.anchor})`);
+  const ref = doc.component ? COMPONENT_DOC_URL[doc.component] : EXPERIMENTAL_FUNCTIONS[name] ? XOTTL_DOC_URL : FUNCTIONS_DOC_URL;
+  parts.push(`[${doc.component ? `${doc.component} processor` : "OTTL function"} reference](${ref}#${doc.anchor})`);
   return parts.filter(Boolean).join("\n\n");
 }
 
@@ -270,10 +281,10 @@ export function signatureSnippet(signature: string): string {
 }
 
 function functionSuggestion(doc: FunctionDoc, sortPrefix: string): Suggestion {
-  const newer = NOT_IN_ENGINE.has(doc.name);
   const removed = REMOVED_UPSTREAM.has(doc.name) && !EXTRA_KNOWN.has(doc.name);
   const experimental = EXPERIMENTAL_FUNCTIONS[doc.name] ? " · experimental (feature gate)" : "";
-  const tag = experimental || (newer ? ` · newer than ${ENGINE_VERSION} engine` : removed ? " · removed upstream" : "");
+  const component = doc.component ? ` · ${doc.component} processor` : "";
+  const tag = experimental || component || (removed ? " · removed upstream" : "");
   return {
     label: doc.name,
     kind: "function",

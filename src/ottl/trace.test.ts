@@ -11,6 +11,8 @@ import {
   describeError,
   isErrorMode,
   DEFAULT_ERROR_MODE_NOTE,
+  setArguments,
+  wroteEmpty,
   type EvalFn,
 } from "./trace";
 
@@ -244,9 +246,10 @@ describe("traceStatements", () => {
   });
 
   it("explains a converter that returned nil", () => {
-    const r = traceStatements('set(x, Int("abc"))', "logs", PAYLOAD, engine);
+    const r = traceStatements('set(x, Int("abc"))', "logs", PAYLOAD, engine, "ignore", { engineVersion: "v0.146.0" });
     expect(r.steps[0].verdict).toBe("no-effect");
-    expect(r.steps[0].note).toMatch(/returned nil/);
+    expect(r.steps[0].note).toMatch(/Int\("abc"\) was nil in this record/);
+    expect(r.steps[0].note).toMatch(/including this engine \(v0\.146\.0\)/);
   });
 
   it("does not blame a converter that only appears in the where guard", () => {
@@ -272,7 +275,7 @@ describe("traceStatements", () => {
   });
 
   it("gives the documented hint for trace_id without .string", () => {
-    const r = traceStatements('set(trace_id, "abc")', "traces", PAYLOAD, engine);
+    const r = traceStatements('set(trace_id, "abc")', "traces", PAYLOAD, engine, "ignore", { engineVersion: "v0.146.0" });
     expect(r.steps[0].verdict).toBe("no-effect");
     expect(r.steps[0].note).toMatch(/\.string suffix/);
   });
@@ -438,12 +441,25 @@ describe("0.3 wording (checked against the trade harness)", () => {
     expect(describeErrorMode("propagate")).toMatch(/whole batch the processor received — not just this record — is DROPPED/);
   });
   it("the trace_id hint is version-qualified", () => {
-    const h = knownNoOpHint('set(span.trace_id, "0102")')!;
-    expect(h).toMatch(/up to v0\.149 — including the bundled v0\.146\.0 engine — ignore the assignment silently/);
+    const h = knownNoOpHint('set(span.trace_id, "0102")', "v0.146.0")!;
+    expect(h).toMatch(/up to v0\.149 — including this engine \(v0\.146\.0\) — ignore the assignment silently/);
     expect(h).toMatch(/From v0\.150 it is a run-time error: logged under ignore, the batch is dropped under propagate, invisible under silent/);
+    // From v0.150 the assignment errors, so a no-op can't be this trap.
+    expect(knownNoOpHint('set(span.trace_id, "0102")', "v0.164.1")).toBeUndefined();
   });
   it("the converter hint is version-qualified", () => {
-    expect(knownNoOpHint('set(log.body, Int("x"))')).toMatch(/silent on collectors up to v0\.157; by v0\.161 it is an error/);
+    const old = knownNoOpHint('set(log.body, Int(log.attributes["n"]))', "v0.157.0")!;
+    expect(old).toMatch(/what collectors up to v0\.160 do, including this engine \(v0\.157\.0\)/);
+    expect(old).toMatch(/From v0\.161 set\(\) writes nil as an EMPTY value, overwriting log\.body/);
+    expect(old).toMatch(/a failed conversion is an error instead of nil/);
+    expect(old).toMatch(/add `where Int\(log\.attributes\["n"\]\) != nil`/);
+    expect(knownNoOpHint('set(log.body, Int(log.attributes["n"]))', "v0.161.0")).toBe("log.body already had this value, so set() changed nothing.");
+  });
+  it("a nil path source gets the v0.161 warning on older engines", () => {
+    const h = knownNoOpHint('set(log.attributes["u"], log.attributes["missing"]) where log.body != nil', "v0.146.0")!;
+    expect(h).toMatch(/log\.attributes\["missing"\] was nil in this record \(for example a missing attribute\)/);
+    expect(h).toMatch(/add `and log\.attributes\["missing"\] != nil` to the where clause/);
+    expect(knownNoOpHint('set(log.attributes["u"], "x")', "v0.146.0")).toBeUndefined(); // literals are never nil
   });
   it("a type-mismatched guard says it can never match", () => {
     const engine: EvalFn = (statements, _s, payload) => {
@@ -454,5 +470,54 @@ describe("0.3 wording (checked against the trade harness)", () => {
     const r = traceStatements('set(log.body, "x") where log.severity_number == "9"', "logs", PAYLOAD, engine);
     expect(r.steps[0].verdict).toBe("not-matched");
     expect(r.steps[0].note).toMatch(/^This where clause can never match any payload: log\.severity_number is an int64/);
+  });
+});
+
+describe("0.4: set() writes nil as an empty value from v0.161", () => {
+  // Shapes taken from the real v0.164.1 engine (scripts/verify-engine.mjs probes these).
+  const withUser = JSON.stringify({ resourceLogs: [{ resource: {}, scopeLogs: [{ scope: {}, logRecords: [{ body: { stringValue: "hi" }, attributes: [{ key: "user", value: { stringValue: "alice" } }] }] }] }] });
+  const emptied = JSON.stringify({ resourceLogs: [{ resource: {}, scopeLogs: [{ scope: {}, logRecords: [{ body: { stringValue: "hi" }, attributes: [{ key: "user", value: {} }] }] }] }] });
+  const created = JSON.stringify({ resourceLogs: [{ resource: {}, scopeLogs: [{ scope: {}, logRecords: [{ body: { stringValue: "hi" }, attributes: [{ key: "user", value: { stringValue: "alice" } }, { key: "new", value: {} }] }] }] }] });
+  const engineWith = (out: string): EvalFn => (s, _sig, p) => ({ ok: true, output: /1 == 2/.test(s) ? p : out });
+
+  it("reports an overwrite with an empty value as a cautioned change", () => {
+    const r = traceStatements('set(log.attributes["user"], log.attributes["missing"])', "logs", withUser, engineWith(emptied), "ignore", { engineVersion: "v0.164.1" });
+    const step = r.steps[0];
+    expect(step.verdict).toBe("changed");
+    expect(step.caution).toBe(true);
+    expect(step.display?.[0].text).toBe('"alice" → (empty)');
+    expect(step.note).toMatch(/^log\.attributes\["missing"\] was nil in this record/);
+    expect(step.note).toMatch(/log\.attributes\["user"\] was overwritten with an empty value/);
+    expect(step.note).toMatch(/Collectors up to v0\.160 skip the write/);
+    expect(step.note).toMatch(/add `where log\.attributes\["missing"\] != nil`/);
+  });
+
+  it("reports a key created empty", () => {
+    const r = traceStatements('set(log.attributes["new"], log.attributes["missing"])', "logs", withUser, engineWith(created), "ignore", { engineVersion: "v0.164.1" });
+    expect(r.steps[0].caution).toBe(true);
+    expect(r.steps[0].note).toMatch(/log\.attributes\["new"\] was created with an empty value/);
+    expect(r.steps[0].display?.[0]).toMatchObject({ kind: "added", text: "(empty)" });
+  });
+
+  it("does not caution ordinary changes or non-set editors", () => {
+    const changed = JSON.stringify({ resourceLogs: [{ resource: {}, scopeLogs: [{ scope: {}, logRecords: [{ body: { stringValue: "hi" }, attributes: [{ key: "user", value: { stringValue: "bob" } }] }] }] }] });
+    expect(traceStatements('set(log.attributes["user"], "bob")', "logs", withUser, engineWith(changed)).steps[0].caution).toBeUndefined();
+    expect(traceStatements('delete_key(log.attributes, "user")', "logs", withUser, engineWith(emptied)).steps[0].caution).toBeUndefined();
+  });
+
+  it("parses set() arguments with nested commas and strings", () => {
+    expect(setArguments('set(log.attributes["a,b"], Concat([log.body, "x,y"], "-")) where true')).toEqual({ target: 'log.attributes["a,b"]', value: 'Concat([log.body, "x,y"], "-")' });
+    expect(setArguments("keep_keys(log.attributes, [\"a\"])")).toBeUndefined();
+    expect(setArguments("set(log.body)")).toBeUndefined();
+  });
+
+  it("wroteEmpty distinguishes created from overwritten", () => {
+    expect(wroteEmpty([{ path: "x", kind: "added", after: { key: "k", value: {} } }])).toBe("created");
+    expect(wroteEmpty([{ path: "x", kind: "changed", before: { stringValue: "a" }, after: {} }])).toBe("overwritten");
+    expect(wroteEmpty([{ path: "x", kind: "changed", before: { stringValue: "a" }, after: { stringValue: "b" } }])).toBeUndefined();
+  });
+
+  it("diffs a value that became empty as one change", () => {
+    expect(diffJSON({ v: { stringValue: "a" } }, { v: {} })).toEqual([{ path: "v", kind: "changed", before: { stringValue: "a" }, after: {} }]);
   });
 });

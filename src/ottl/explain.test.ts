@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyError, explainEngineError, editDistance, segmentsAfter, suggestSegment, unqualifiedPath, functionsIn } from "./explain";
+import { classifyError, explainEngineError, editDistance, segmentsAfter, suggestSegment, unqualifiedPath, functionsIn, unavailableReason } from "./explain";
 
 // Messages below are verbatim from the real engine (contrib v0.146.0).
 const UNKNOWN_NEWER =
@@ -20,7 +20,11 @@ describe("classifyError", () => {
 
 describe("explainEngineError", () => {
   it("explains a function that is newer than the bundled engine", () => {
-    expect(explainEngineError(UNKNOWN_NEWER)).toMatch(/`clear` is a real OTTL function, but it was added after v0\.146\.0/);
+    // clear first appears in the v0.160.0 engine; the one before it in the history is v0.157.0.
+    expect(explainEngineError(UNKNOWN_NEWER, "", "v0.146.0")).toBe(
+      "`clear` is a real OTTL function, but it was added after v0.157.0, so the v0.146.0 engine doesn't have it. Pick collector version v0.160.0 or newer to run it.");
+    // The same message on an engine that has clear is a context problem, not an age problem.
+    expect(explainEngineError(UNKNOWN_NEWER, "", "v0.164.1")).toMatch(/can't be used in this context/);
   });
 
   it("suggests the right casing for a mis-cased function", () => {
@@ -37,19 +41,43 @@ describe("explainEngineError", () => {
   });
 
   it("mentions the feature gate for an experimental function the engine lacks", () => {
-    expect(explainEngineError(UNKNOWN_NEWER.replace(/"clear"$/, '"Filter"'))).toMatch(/needs the `ottl\.functions\.enableLambda` feature gate/);
+    expect(explainEngineError(UNKNOWN_NEWER.replace(/"clear"$/, '"Filter"'), "", "v0.146.0")).toMatch(/Pick collector version v0\.157\.0 or newer.*experimental: Collectors need `--feature-gates=ottl\.functions\.enableLambda`/);
+  });
+
+  it("explains the v0.155+ feature-gate rejection and how to enable it in the dry-run", () => {
+    const msg = 'OTTL parse error: unable to parse OTTL statement "x": error while parsing arguments for call to "set": invalid argument at position 1: function "Filter" is experimental and requires the `ottl.functions.enableLambda` feature gate to be enabled';
+    expect(explainEngineError(msg)).toBe("`Filter` is experimental. Collectors need `--feature-gates=ottl.functions.enableLambda` to run it. To run it in the dry-run too, add `ottl.functions.enableLambda` to the `ottl.dryRun.featureGates` setting.");
+  });
+
+  it("explains a plain value where a list is required (verbatim v0.164.1 message)", () => {
+    const msg = 'OTTL parse error: unable to parse OTTL statement "keep_keys(log.attributes, \\"http.method\\")": 1:27: statement failed to parse near `"http.meth`: error while parsing arguments for call to "keep_keys": invalid argument at position 1: must be a list of type StringGetter[*ottllog.TransformContext]';
+    expect(explainEngineError(msg)).toMatch(/^`keep_keys` expects a list here — wrap the value in brackets/);
+  });
+
+  it("reads the v0.163+ syntax-error format", () => {
+    const msg = 'OTTL parse error: unable to infer a valid context (["resource" "scope" "log"]) from statements ["set(log.attributes[\\"x\\"] \\"y\\")"] and conditions []: 1:25: statement has invalid syntax near `"y")`: (expected ")" Key*)';
+    expect(explainEngineError(msg, 'set(log.attributes["x"] "y")')).toBe("Syntax error at column 25: the engine couldn't read `\"y\")`.");
+  });
+
+  it("unavailableReason knows additions and removals per engine", () => {
+    expect(unavailableReason("IsEmpty", "v0.153.0")).toMatch(/Pick collector version v0\.157\.0 or newer/);
+    expect(unavailableReason("IsEmpty", "v0.157.0")).toBeUndefined();
+    expect(unavailableReason("Base64Decode", "v0.161.0")).toMatch(/removed in v0\.161\.0; use `Decode\(value, "base64"\)` instead/);
+    expect(unavailableReason("Base64Decode", "v0.157.0")).toBeUndefined();
+    expect(unavailableReason("set", "v0.140.0")).toBeUndefined();
   });
 
   it("explains a lambda the bundled engine can't lex (verbatim engine message)", () => {
     const stmt = 'set(log.attributes["t"], Filter(log.attributes, (k, _) => k == "environment"))';
     const msg = 'OTTL parse error: unable to infer a valid context (["resource" "scope" "log"]) from statements ["set(log.attributes[\\"t\\"], Filter(log.attributes, (k, _) => k == \\"environment\\"))"] and conditions []: statement has invalid syntax: 1:53: lexer: invalid input text "_) => k == \\"envi..."';
-    expect(explainEngineError(msg, stmt)).toMatch(/uses `Filter` with lambda syntax, which the bundled dry-run engine \(v0\.146\.0\) can't parse yet/);
-    expect(explainEngineError(msg, stmt)).toMatch(/ottl\.functions\.enableLambda/);
+    expect(explainEngineError(msg, stmt, "v0.146.0")).toMatch(/^`Filter` is a real OTTL function, but it was added after v0\.153\.0, so the v0\.146\.0 engine doesn't have it/);
+    expect(explainEngineError(msg, stmt, "v0.146.0")).toMatch(/ottl\.functions\.enableLambda/);
   });
 
   it("explains lambda syntax without a known newer function", () => {
     const msg = "OTTL parse error: x: statement has invalid syntax: 1:30: lexer: invalid input text \"_) => v\"";
-    expect(explainEngineError(msg, "set(log.body, Mystery(x, (_, v) => v))")).toMatch(/Lambda syntax \(`=>`\) isn't supported/);
+    expect(explainEngineError(msg, "set(log.body, Mystery(x, (_, v) => v))", "v0.146.0")).toBe("The v0.146.0 engine can't parse lambda syntax (`=>`) here.");
+    expect(explainEngineError(msg, "set(log.body, Filter(x, v => v))")).toMatch(/lambdas take exactly two parameters/);
   });
 
   it("points at the column and text for an ordinary syntax error", () => {
@@ -63,7 +91,7 @@ describe("explainEngineError", () => {
   });
 
   it("recognises the undefined-function wording too", () => {
-    expect(explainEngineError('undefined function "IsEmpty"')).toMatch(/added after/);
+    expect(explainEngineError('undefined function "IsEmpty"', "", "v0.150.0")).toMatch(/added after v0\.153\.0/);
   });
 
   it("suggests the closest valid path for a typo", () => {

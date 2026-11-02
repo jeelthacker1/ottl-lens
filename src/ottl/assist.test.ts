@@ -22,9 +22,18 @@ describe("hover", () => {
     expect(hoverAt(text, col)!.markdown).toContain("*Editor*");
   });
 
-  it("notes when a function is newer than the bundled engine", () => {
+  it("notes when a function was added, from the per-version history", () => {
     const { text, col } = at("cle|ar(log.attributes)");
-    expect(hoverAt(text, col)!.markdown).toMatch(/Added after v0\.146\.0/);
+    expect(hoverAt(text, col)!.markdown).toMatch(/Available from collector releases after v0\.157\.0 \(first in v0\.160\.0\)/);
+  });
+
+  it("documents transform- and filter-processor functions and says they are component-only", () => {
+    const md = functionMarkdown("convert_gauge_to_sum")!;
+    expect(md).toMatch(/convert_gauge_to_sum\(aggregation_temporality, is_monotonic\)/);
+    expect(md).toMatch(/Provided by the transform processor only/);
+    expect(md).toMatch(/transformprocessor\/README\.md#convert_gauge_to_sum/);
+    expect(functionMarkdown("HasAttrOnDatapoint")).toMatch(/Provided by the filter processor only/);
+    expect(functionMarkdown("ParseCEF")).toMatch(/Common Event Format/);
   });
 
   it("marks experimental lambda functions with their feature gate", () => {
@@ -37,7 +46,7 @@ describe("hover", () => {
   });
 
   it("notes a removed function and its replacement", () => {
-    expect(functionMarkdown("Base64Decode")).toMatch(/Removed from the latest OTTL — use `Decode\(value, "base64"\)`/);
+    expect(functionMarkdown("Base64Decode")).toMatch(/Removed in v0\.161\.0 — use `Decode\(value, "base64"\)`/);
   });
 
   it("documents component-scoped functions", () => {
@@ -143,7 +152,7 @@ describe("completion", () => {
     const { text, col } = at("|");
     const items = completionsAt(text, col).items;
     expect(items.find((i) => i.label === "Base64Decode")!.deprecated).toBe(true);
-    expect(items.find((i) => i.label === "clear")!.detail).toMatch(/newer than v0\.146\.0 engine/);
+    expect(items.find((i) => i.label === "convert_gauge_to_sum")!.detail).toMatch(/· transform processor$/);
   });
 
   it("works on YAML list items (statement start after '- ')", () => {

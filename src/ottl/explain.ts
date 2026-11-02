@@ -15,9 +15,38 @@ import {
   CONTEXT_PATHS,
   ENGINE_VERSION,
   EXPERIMENTAL_FUNCTIONS,
+  FUNCTION_REMOVED_IN,
+  FUNCTION_SINCE,
+  HISTORY_VERSIONS,
   KNOWN_FUNCTIONS,
-  NOT_IN_ENGINE,
 } from "./catalog";
+import { REMOVED_REPLACEMENTS } from "./extras";
+import { atLeast } from "./versions";
+
+/**
+ * Why a known function can't run on this engine version, or undefined when it can.
+ * Based on the per-version function lists generated from upstream docs (FUNCTION_SINCE).
+ */
+export function unavailableReason(name: string, engineVersion: string = ENGINE_VERSION): string | undefined {
+  const since = FUNCTION_SINCE[name];
+  if (since && !atLeast(engineVersion, since)) {
+    const i = HISTORY_VERSIONS.indexOf(since);
+    const prev = i > 0 ? HISTORY_VERSIONS[i - 1] : undefined;
+    return `\`${name}\` is a real OTTL function, but it was added after ${prev && atLeast(prev, engineVersion) ? prev : engineVersion}, so the ${engineVersion} engine doesn't have it. ` +
+      `Pick collector version ${since} or newer to run it.`;
+  }
+  const removed = FUNCTION_REMOVED_IN[name];
+  if (removed && atLeast(engineVersion, removed)) {
+    const r = REMOVED_REPLACEMENTS[name];
+    return `\`${name}\` was removed in ${removed}${r ? `; use \`${r}\` instead` : ""}.`;
+  }
+  return undefined;
+}
+
+/** Feature-gate advice for an experimental function the engine rejected. */
+function gateAdvice(gate: string): string {
+  return `Collectors need \`--feature-gates=${gate}\` to run it. To run it in the dry-run too, add \`${gate}\` to the \`ottl.dryRun.featureGates\` setting.`;
+}
 
 export type ErrorClass = "config" | "payload" | "runtime";
 
@@ -103,7 +132,20 @@ export function unqualifiedPath(statement: string): string | undefined {
  * have nothing better to say than the raw message. Passing the failing statement
  * lets us tell apart errors whose messages are identical.
  */
-export function explainEngineError(message: string, statement = ""): string | undefined {
+export function explainEngineError(message: string, statement = "", engineVersion: string = ENGINE_VERSION): string | undefined {
+  // Experimental function without its feature gate (v0.155+ wording).
+  const gated = /function "(\w+)" is experimental and requires the `([\w.]+)` feature gate/.exec(message);
+  if (gated) {
+    return `\`${gated[1]}\` is experimental. ${gateAdvice(gated[2])}`;
+  }
+
+  // A plain value where a list is required: keep_keys(x, "a"), Concat("a", "-").
+  if (/must be a list of type/.test(message)) {
+    const fn = /error while parsing arguments for call to "(\w+)"[^"]*$/.exec(message.split("invalid argument")[0])?.[1];
+    return `${fn ? `\`${fn}\`` : "This function"} expects a list here — wrap the value in brackets, for example \`["http.method"]\`. ` +
+      "From v0.163 a path or converter that returns a list also works.";
+  }
+
   // Mis-cased converter: its own message.
   const lower = /converter names must start with an uppercase letter but got '(\w+)'/.exec(message);
   if (lower) {
@@ -117,12 +159,10 @@ export function explainEngineError(message: string, statement = ""): string | un
   let m = /does not support the function "(\w+)"|undefined function "(\w+)"/.exec(message);
   if (m) {
     const name = m[1] ?? m[2];
-    if (NOT_IN_ENGINE.has(name)) {
+    const why = unavailableReason(name, engineVersion);
+    if (why) {
       const gate = EXPERIMENTAL_FUNCTIONS[name];
-      return `\`${name}\` is a real OTTL function, but it was added after ${ENGINE_VERSION}, the version the bundled dry-run engine is built from, so it can't be executed here yet. ` +
-        (gate
-          ? `On newer collectors it's experimental and needs the \`${gate}\` feature gate.`
-          : "Collectors on newer versions support it.");
+      return why + (gate ? ` It's experimental: ${gateAdvice(gate)}` : "");
     }
     if (!KNOWN_FUNCTIONS.has(name)) {
       const fix = CASEFOLD_INDEX.get(name.toLowerCase());
@@ -145,21 +185,26 @@ export function explainEngineError(message: string, statement = ""): string | un
       : `\`${shown}\` isn't a valid path${before ? ` — valid fields after \`${before}.\` include ${segmentsAfter(before).slice(0, 6).map((s) => "`" + s + "`").join(", ")}` : ""}.`;
   }
 
-  // Syntax errors. The bundled engine can't lex syntax added after it (lambdas: `(k, v) => …`),
-  // so blame the newer feature when the statement uses one.
-  const syntax = /statement has invalid syntax: (\d+):(\d+): (?:lexer: )?([\s\S]*)$/.exec(message);
-  if (syntax) {
-    const col = Number(syntax[2]);
-    const newer = functionsIn(statement).find((n) => NOT_IN_ENGINE.has(n));
+  // Syntax errors. Two formats: up to v0.162 "statement has invalid syntax: 1:25: …", from
+  // v0.163 "1:25: statement has invalid syntax near `…`: …". An engine can't lex syntax added
+  // after it (lambdas: `(k, v) => …`), so blame the newer feature when the statement uses one.
+  const oldSyntax = /statement has invalid syntax: (\d+):(\d+): (?:lexer: )?([\s\S]*)$/.exec(message);
+  const newSyntax = /(\d+):(\d+): statement has invalid syntax near `([^`]*)`/.exec(message);
+  if (oldSyntax || newSyntax) {
+    const col = Number((oldSyntax ?? newSyntax)![2]);
+    const newer = functionsIn(statement).find((n) => unavailableReason(n, engineVersion));
     if (newer) {
       const gate = EXPERIMENTAL_FUNCTIONS[newer];
-      return `This statement uses \`${newer}\`${/=>/.test(statement) ? " with lambda syntax" : ""}, which the bundled dry-run engine (${ENGINE_VERSION}) can't parse yet. ` +
-        (gate ? `On newer collectors it's experimental and needs the \`${gate}\` feature gate.` : "Collectors on newer versions support it.");
+      return unavailableReason(newer, engineVersion)! + (gate ? ` It's experimental: ${gateAdvice(gate)}` : "");
     }
     if (/=>/.test(statement)) {
-      return `Lambda syntax (\`=>\`) isn't supported by the bundled dry-run engine (${ENGINE_VERSION}). Newer collectors support it behind the \`ottl.functions.enableLambda\` feature gate.`;
+      return /\(\s*\w+\s*,\s*\w+\s*\)\s*=>/.test(statement)
+        ? `The ${engineVersion} engine can't parse lambda syntax (\`=>\`) here.`
+        : "OTTL lambdas take exactly two parameters, `(key_or_index, value) => …` — use `_` for one you don't need.";
     }
-    const near = /invalid input text "([^"]{0,24})/.exec(syntax[3])?.[1] ?? statement.slice(Math.max(0, col - 1), col + 15);
+    const near = newSyntax
+      ? newSyntax[3]
+      : /invalid input text "([^"]{0,24})/.exec(oldSyntax![3])?.[1] ?? statement.slice(Math.max(0, col - 1), col + 15);
     return `Syntax error at column ${col}: the engine couldn't read \`${near.replace(/\\"/g, '"').trim()}\`.`;
   }
 

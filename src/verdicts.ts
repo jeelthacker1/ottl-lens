@@ -9,6 +9,7 @@ import type { InlineKind, InlineVerdict } from "./ottl/inline";
 
 const COLORS: Record<InlineKind, vscode.ThemeColor> = {
   "changed": new vscode.ThemeColor("testing.iconPassed"),
+  "caution": new vscode.ThemeColor("editorWarning.foreground"),
   "no-effect": new vscode.ThemeColor("editorWarning.foreground"),
   "not-matched": new vscode.ThemeColor("descriptionForeground"),
   "error": new vscode.ThemeColor("editorError.foreground"),

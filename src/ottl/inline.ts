@@ -7,7 +7,8 @@
 import type { StepResult } from "./trace";
 import type { StatementLine } from "./yaml";
 
-export type InlineKind = "changed" | "no-effect" | "not-matched" | "error";
+/** `caution` is a `changed` step that wrote an empty value (set() with a nil value, v0.161+). */
+export type InlineKind = "changed" | "caution" | "no-effect" | "not-matched" | "error";
 
 export interface InlineVerdict {
   line: number;
@@ -30,7 +31,7 @@ export function inlineLabel(step: StepResult): string {
       const sigil = (k: string) => (k === "added" ? "+" : k === "removed" ? "−" : "~");
       const first = rows[0] ? `${sigil(rows[0].kind)} ${rows[0].label}${rows[0].kind === "changed" ? ": " : " = "}${rows[0].text}` : "";
       const more = rows.length > 1 ? `  (+${rows.length - 1} more)` : "";
-      return clip(`✓ changed  ${first}${more}`, 90);
+      return clip(`${step.caution ? "⚠ wrote an empty value" : "✓ changed"}  ${first}${more}`, 90);
     }
     case "no-effect":
       return "⚠ no effect";
@@ -67,7 +68,8 @@ export function mapVerdicts(steps: StepResult[], items: StatementLine[]): Inline
       if (items[j].text === step.statement) { found = j; break; }
     }
     if (found === -1) continue;
-    out.push({ line: items[found].line, kind: step.verdict, label: inlineLabel(step), detail: inlineDetail(step) });
+    const kind: InlineKind = step.verdict === "changed" && step.caution ? "caution" : step.verdict;
+    out.push({ line: items[found].line, kind, label: inlineLabel(step), detail: inlineDetail(step) });
     cursor = found + 1;
   }
   return out;
