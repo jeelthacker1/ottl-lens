@@ -4,7 +4,7 @@
  * real thing disagree (it has caught several).
  *
  *   1. the bundled engine (media/ottl.wasm, latest);
- *   2. every downloadable engine (OTTL_ENGINES_DIR, default ../ottl-engines — the files
+ *   2. every downloadable engine (OTTL_ENGINES_DIR, default .engines/ from `npm run fetch:engines`; the files
  *      published in the `engines-1` GitHub release), each verified against the sha256
  *      pinned in src/ottl/engines.ts, then checked at the behaviour boundary it exists for.
  *
@@ -185,7 +185,7 @@ for (const [stmt, sig, payload] of [
 
 // 9. Every downloadable engine: integrity, samples, and the boundary it exists for.
 if (!process.argv.includes("--bundled-only")) {
-  const dir = resolve(process.env.OTTL_ENGINES_DIR ?? join(root, "..", "ottl-engines"));
+  const dir = resolve(process.env.OTTL_ENGINES_DIR ?? (existsSync(join(root, ".engines")) ? join(root, ".engines") : join(root, "..", "ottl-engines")));
   const engines = {};
   for (const info of L.ENGINES) {
     const file = join(dir, `ottl-${info.version}.wasm.gz`);

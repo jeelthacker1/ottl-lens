@@ -129,7 +129,7 @@
             "type": "string"
           },
           "default": [],
-          "markdownDescription": "Collector feature gates to enable in the dry-run, as you would pass them with `--feature-gates` — for example `ottl.functions.enableLambda` to run the experimental lambda functions (`Filter`, `MapEach`, …)."
+          "markdownDescription": "Collector feature gates to enable in the dry-run, as you would pass them with `--feature-gates`. For example, `ottl.functions.enableLambda` runs the experimental lambda functions (`Filter`, `MapEach`, …)."
         }
       }
     }
@@ -144,7 +144,8 @@
     "build:wasm": "bash scripts/build-wasm.sh",
     "verify:engine": "node scripts/verify-engine.mjs",
     "bundle": "node esbuild.js",
-    "vscode:prepublish": "node esbuild.js"
+    "vscode:prepublish": "node esbuild.js",
+    "fetch:engines": "node scripts/fetch-engines.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

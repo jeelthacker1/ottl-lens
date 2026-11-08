@@ -1,0 +1,22 @@
+name: Wrong lint warning
+description: A warning on valid OTTL, or a missed mistake
+labels: ["bug", "area: lint"]
+body:
+  - type: textarea
+    id: line
+    attributes:
+      label: The line
+      render: yaml
+    validations:
+      required: true
+  - type: input
+    id: message
+    attributes:
+      label: Warning shown (or "none")
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it's wrong
+      description: A link to the OTTL docs or your collector output helps.

@@ -1,0 +1,34 @@
+name: Wrong dry-run result
+description: The dry-run says something your collector doesn't do
+labels: ["bug", "area: dry-run"]
+body:
+  - type: textarea
+    id: statement
+    attributes:
+      label: Statement or block
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: payload
+    attributes:
+      label: Payload
+      description: OTLP JSON or debug exporter output. Remove anything private.
+      render: json
+  - type: input
+    id: version
+    attributes:
+      label: Collector version
+      placeholder: v0.164.1
+    validations:
+      required: true
+  - type: textarea
+    id: got
+    attributes:
+      label: What OTTL Lens showed
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What the collector actually does

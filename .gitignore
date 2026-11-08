@@ -4,9 +4,9 @@ out/
 .DS_Store
 .tmp/
 coverage/
-# WASM build artifacts (built locally via npm run build:wasm)
+# WASM engines (npm run fetch:engines, or build with scripts/build-engines.sh)
 media/ottl.wasm
-media/wasm_exec.js
+.engines/
 
 # internal / private — do NOT publish
 .claude/
